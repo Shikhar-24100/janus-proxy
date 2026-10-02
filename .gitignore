@@ -1,0 +1,4 @@
+# Local Go toolchain, build cache, and compiled binaries.
+.tools/
+.cache/
+*.exe
