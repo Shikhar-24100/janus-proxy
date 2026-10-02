@@ -2,3 +2,8 @@
 .tools/
 .cache/
 *.exe
+
+# Local credentials.
+.env
+.env.*
+!.env.example

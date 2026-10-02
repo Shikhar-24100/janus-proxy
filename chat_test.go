@@ -9,6 +9,14 @@ import (
 )
 
 func TestChatHandler(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"id": "test-completion"})
+	}))
+	defer upstream.Close()
+	provider, err := newProvider(upstream.URL, "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name   string
 		body   string
@@ -33,7 +41,7 @@ func TestChatHandler(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(test.body))
 			response := httptest.NewRecorder()
-			chatHandler(response, request)
+			provider.chatHandler(response, request)
 			if response.Code != test.status {
 				t.Fatalf("status = %d, want %d; body = %s", response.Code, test.status, response.Body.String())
 			}
@@ -45,8 +53,8 @@ func TestChatHandler(t *testing.T) {
 				t.Fatalf("invalid JSON response: %v", err)
 			}
 			if test.status == 200 {
-				if body["status"] != "validated" || body["model"] != "demo-model" || body["message_count"] != float64(1) {
-					t.Fatalf("unexpected acknowledgement: %v", body)
+				if body["id"] != "test-completion" {
+					t.Fatalf("unexpected provider response: %v", body)
 				}
 			} else if body["error"] == nil {
 				t.Fatal("error response must contain error details")

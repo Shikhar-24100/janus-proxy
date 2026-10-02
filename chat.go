@@ -22,7 +22,7 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-func chatHandler(w http.ResponseWriter, r *http.Request) {
+func (p *Provider) chatHandler(w http.ResponseWriter, r *http.Request) {
 	// Limit the body to 1 MiB before parsing client-controlled JSON.
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	defer r.Body.Close()
@@ -70,12 +70,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Temporary acknowledgement: no provider call or completion is made yet.
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":        "validated",
-		"model":         request.Model,
-		"message_count": len(request.Messages),
-	})
+	p.forwardChat(w, r, request)
 }
 
 func writeDecodeError(w http.ResponseWriter, err error) {
