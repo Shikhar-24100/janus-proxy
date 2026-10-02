@@ -9,6 +9,19 @@ one OpenAI-compatible upstream. No external Go dependencies.
 
 Requires Go 1.22 or newer. In PowerShell:
 
+For local Groq setup, copy `.env.example` to `.env`, set your key there, and run:
+
+```powershell
+.\run.ps1
+```
+
+The script loads the two settings from `.env` (overriding values in that terminal)
+and uses the project-local Go toolchain if available, otherwise Go from PATH.
+The `.env` format is plain `NAME=value`, without quotes or inline comments.
+The real `.env` is ignored by Git; `.env.example` contains placeholders only.
+
+You can also configure the Go program directly:
+
 ```powershell
 $env:OPENAI_API_KEY = 'your-provider-key'
 go run .
@@ -23,7 +36,7 @@ $env:GOCACHE = Join-Path (Get-Location) '.cache\go-build'
 
 The server listens on `127.0.0.1:8080`. Stop it with Ctrl+C.
 Environment variables must be set in the same terminal before starting the server.
-There is no automatic `.env` file loading.
+The Go program itself does not load `.env`; `run.ps1` handles that for local runs.
 
 `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1`. You can set it to
 another trusted OpenAI-compatible provider's API base URL, including its version
@@ -49,8 +62,8 @@ the newer file on disk.
 
 ## Send a request
 
-Edit `request.json` and replace `demo-model` with a model available to your
-provider. It is a placeholder used by local tests, not a real model name.
+`request.json` contains a small Groq chat request. When changing providers, set
+its `model` to a model ID available to your account.
 In a second PowerShell terminal:
 
 ```powershell

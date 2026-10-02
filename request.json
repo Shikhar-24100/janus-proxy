@@ -1,9 +1,9 @@
 {
-  "model": "demo-model",
+  "model": "openai/gpt-oss-20b",
   "messages": [
     {
       "role": "user",
-      "content": "Hello, Janus!"
+      "content": "Reply with exactly: Hello from Groq through Janus!"
     }
   ]
 }
