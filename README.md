@@ -33,6 +33,20 @@ loopback HTTP endpoints are allowed for development.
 Without an API key, `/health` still works, but valid chat requests return 503.
 Keys belong in local environment variables, never in source or request JSON.
 
+## VS Code and a local Go toolchain
+
+If the Go extension cannot find `go`, set `go.alternateTools.go` in your local
+`.vscode/settings.json` to the absolute path of `.tools/go/bin/go.exe`.
+That settings file is ignored by Git because paths are machine-specific.
+Reload VS Code after changing the configuration. New integrated terminals can
+use `go` if `.tools/go/bin` is added to their PATH; existing terminals retain
+their previous environment.
+
+An unsaved editor tab can show an older version of a file changed on disk.
+Copy any notes or edits you want to keep, then use `File: Revert File` on that
+tab to load the saved version. Saving the stale tab instead would overwrite
+the newer file on disk.
+
 ## Send a request
 
 Edit `request.json` and replace `demo-model` with a model available to your

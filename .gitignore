@@ -7,3 +7,6 @@
 .env
 .env.*
 !.env.example
+
+# Machine-specific editor settings.
+.vscode/settings.json
