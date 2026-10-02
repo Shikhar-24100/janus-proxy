@@ -65,11 +65,6 @@ func (p *Provider) chatHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if request.Stream {
-		writeRequestError(w, http.StatusBadRequest, "Streaming is not implemented yet.")
-		return
-	}
-
 	p.forwardChat(w, r, request)
 }
 

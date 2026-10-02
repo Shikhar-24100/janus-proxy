@@ -76,8 +76,12 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 		writeGatewayError(w, http.StatusBadGateway, "Provider returned an unexpected redirect.")
 		return
 	}
+	if input.Stream && response.StatusCode == http.StatusOK {
+		p.forwardStream(w, r, response)
+		return
+	}
 
-	// Non-streaming only: read a bounded response before sending its status to our client.
+	// Complete JSON responses, including provider errors, use the buffered path.
 	const maxResponseBytes = 4 << 20
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {

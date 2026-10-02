@@ -2,7 +2,7 @@
 
 A Go LLM gateway built one working step at a time.
 
-Currently supports a local health endpoint and non-streaming chat requests to
+Currently supports a local health endpoint and streaming or non-streaming chat requests to
 one OpenAI-compatible upstream. No external Go dependencies.
 
 ## Run
@@ -76,6 +76,53 @@ Invoke-RestMethod `
   -InFile request.json
 ```
 
+PowerShell summarizes nested objects. To print the answer, store the result in
+`$response` and read `$response.choices[0].message.content`. To inspect all fields,
+use `$response | ConvertTo-Json -Depth 20`.
+
+## Streaming
+
+Start Janus with `.\run.ps1`. In a second terminal, use the native curl executable:
+
+```powershell
+curl.exe --no-buffer --silent --show-error `
+  http://localhost:8080/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  --data-binary "@request-stream.json"
+```
+
+`request-stream.json` sets `stream: true`. A normal request returns one complete
+JSON answer. A streaming request returns Server-Sent Events (SSE) over the same
+HTTP response as the provider generates them. Each event is separated by a blank
+line, typically with `data: {...}` containing JSON. Text fragments appear under
+`choices[0].delta.content`; some events contain roles, reasoning, finish reasons,
+or usage instead. `data: [DONE]` is the provider's completion marker.
+
+Janus checks for a successful `text/event-stream` response, then reads into a
+32 KiB buffer, writes the available bytes, and flushes. Flushing sends buffered
+bytes toward the client immediately. A network read is not necessarily one
+token or one event: events and UTF-8 characters can span reads. Janus preserves
+all bytes and framing; clients assemble and parse the events. `--no-buffer`
+also tells curl to display incoming data without waiting for its output buffer.
+
+Streaming reduces the wait for the first visible text, not necessarily the time
+to generate the entire answer. It uses bounded memory instead of collecting the
+whole response. Slow client writes naturally pause upstream reads (backpressure).
+
+Provider JSON errors before streaming begins retain their status and body.
+After SSE headers have been sent, Janus cannot replace the HTTP status or switch
+to a JSON error. A read/write failure aborts the response without appending a
+fake completion marker. Clients must treat a stream without `[DONE]` as
+incomplete. Client disconnection cancels the upstream request. The current
+60-second timeout applies to the whole provider call, including streaming;
+separate idle and total deadlines are a future refinement. Janus currently
+forwards SSE without interpreting token usage or detecting completion markers.
+
+Tests use a gated fake provider to prove bytes arrive before generation finishes,
+preserve a split UTF-8 character and SSE framing, check cancellation, and check
+interrupted streams and errors. Provider protocol:
+[Groq streaming documentation](https://console.groq.com/docs/text-chat).
+
 ## Current request flow
 
 ```text
@@ -83,19 +130,20 @@ Client -> router -> JSON decoding -> validation -> provider HTTP call
        <- provider's JSON response and HTTP status <-
 ```
 
-Supported input fields: `model`, `messages`, and `stream: false`.
+Supported input fields: `model`, `messages`, and `stream` (defaults to false).
 Messages support `system`, `user`, and `assistant` roles with non-empty string
-content. Other fields, tool calls, multimodal content, and streaming are not
+content. Other fields, tool calls, and multimodal content are not
 implemented yet. Provider response bodies are forwarded without changing their
 JSON, so completion data and usage are preserved.
 
-Request bodies are limited to 1 MiB; provider responses to 4 MiB.
+Request bodies are limited to 1 MiB; buffered JSON provider responses to 4 MiB.
+SSE responses use a fixed-size buffer without the 4 MiB total-body limit.
 Provider calls have a 60-second timeout and use the incoming request's context
 for cancellation. JSON provider errors keep their status (including 429) and
 `Retry-After`; network failures return 502 and timeouts return 504. Redirects
 are rejected. Non-streaming responses are buffered before sending to the client.
 
-This is a local development gateway. Client authentication, quotas, streaming,
+This is a local development gateway. Client authentication, quotas,
 fallback, caching, and usage accounting are future steps.
 
 ## Check

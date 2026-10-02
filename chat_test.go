@@ -31,7 +31,7 @@ func TestChatHandler(t *testing.T) {
 		{"blank content", `{"model":"demo-model","messages":[{"role":"user","content":" "}]}`, 400},
 		{"wrong field type", `{"model":123,"messages":[]}`, 400},
 		{"unsupported field", `{"model":"demo-model","temperature":0}`, 400},
-		{"streaming unsupported", `{"model":"demo-model","messages":[{"role":"user","content":"Hello"}],"stream":true}`, 400},
+		{"wrong stream type", `{"model":"demo-model","messages":[{"role":"user","content":"Hello"}],"stream":"yes"}`, 400},
 		{"multiple JSON values", `{"model":"demo-model","messages":[{"role":"user","content":"Hello"}]} {}`, 400},
 		{"trailing garbage", `{"model":"demo-model","messages":[{"role":"user","content":"Hello"}]} garbage`, 400},
 		{"oversized body", `{"model":"demo-model","messages":[{"role":"user","content":"` + strings.Repeat("a", 1<<20) + `"}]}`, 413},
