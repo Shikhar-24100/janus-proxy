@@ -9,13 +9,14 @@ one OpenAI-compatible upstream. No external Go dependencies.
 
 Requires Go 1.22 or newer. In PowerShell:
 
-For local Groq setup, copy `.env.example` to `.env`, set your key there, and run:
+For local Groq setup, copy `.env.example` to `.env`, set your provider key and
+your separate `JANUS_API_KEY` there, and run:
 
 ```powershell
 .\run.ps1
 ```
 
-The script loads the two settings from `.env` (overriding values in that terminal)
+The script loads the three settings from `.env` (overriding values in that terminal)
 and uses the project-local Go toolchain if available, otherwise Go from PATH.
 The `.env` format is plain `NAME=value`, without quotes or inline comments.
 The real `.env` is ignored by Git; `.env.example` contains placeholders only.
@@ -24,6 +25,7 @@ You can also configure the Go program directly:
 
 ```powershell
 $env:OPENAI_API_KEY = 'your-provider-key'
+$env:JANUS_API_KEY = 'your-own-janus-client-key'
 go run .
 ```
 
@@ -43,8 +45,26 @@ another trusted OpenAI-compatible provider's API base URL, including its version
 path. Janus appends `/chat/completions`. Remote endpoints require HTTPS;
 loopback HTTP endpoints are allowed for development.
 
-Without an API key, `/health` still works, but valid chat requests return 503.
+Without `JANUS_API_KEY`, startup fails so chat access cannot accidentally be public.
+Without a provider key, `/health` still works, but authenticated valid chat requests return 503.
 Keys belong in local environment variables, never in source or request JSON.
+
+## Client authentication
+
+Clients send `Authorization: Bearer <JANUS_API_KEY>` to Janus. The authentication
+middleware checks that key before decoding the chat body or calling a provider.
+Missing, malformed, duplicate, or incorrect credentials return a JSON 401 error
+with `WWW-Authenticate: Bearer`. `/health` stays public.
+
+The Janus client key and provider key are separate credentials. Janus constructs
+a new upstream request with `OPENAI_API_KEY`, rather than forwarding the client's
+Authorization header. Key comparison uses fixed-size SHA-256 hashes and a
+constant-time comparison. Keys are not logged.
+
+This first version has one shared client key. Tenant identities, individual keys,
+rotation, and Redis quotas are future work. Authorization headers need HTTPS
+when exposing a gateway beyond local development; this server still binds only
+to loopback. Restart Janus after changing its configured key.
 
 ## VS Code and a local Go toolchain
 
@@ -69,11 +89,17 @@ In a second PowerShell terminal:
 ```powershell
 Invoke-RestMethod -Uri http://localhost:8080/health
 
-Invoke-RestMethod `
+# Load only the Janus client key in this terminal, without displaying it.
+$janusKey = (Get-Content .env | Where-Object { $_ -like 'JANUS_API_KEY=*' }).Split('=', 2)[1]
+
+$response = Invoke-RestMethod `
   -Uri http://localhost:8080/v1/chat/completions `
   -Method Post `
+  -Headers @{ Authorization = "Bearer $janusKey" } `
   -ContentType 'application/json' `
   -InFile request.json
+
+$response.choices[0].message.content
 ```
 
 PowerShell summarizes nested objects. To print the answer, store the result in
@@ -85,8 +111,11 @@ use `$response | ConvertTo-Json -Depth 20`.
 Start Janus with `.\run.ps1`. In a second terminal, use the native curl executable:
 
 ```powershell
+$janusKey = (Get-Content .env | Where-Object { $_ -like 'JANUS_API_KEY=*' }).Split('=', 2)[1]
+
 curl.exe --no-buffer --silent --show-error `
   http://localhost:8080/v1/chat/completions `
+  -H "Authorization: Bearer $janusKey" `
   -H "Content-Type: application/json" `
   --data-binary "@request-stream.json"
 ```
@@ -126,7 +155,7 @@ interrupted streams and errors. Provider protocol:
 ## Current request flow
 
 ```text
-Client -> router -> JSON decoding -> validation -> provider HTTP call
+Client -> router -> authentication -> JSON decoding -> validation -> provider HTTP call
        <- provider's JSON response and HTTP status <-
 ```
 
@@ -143,7 +172,7 @@ for cancellation. JSON provider errors keep their status (including 429) and
 `Retry-After`; network failures return 502 and timeouts return 504. Redirects
 are rejected. Non-streaming responses are buffered before sending to the client.
 
-This is a local development gateway. Client authentication, quotas,
+This is a local development gateway. Tenant management, quotas,
 fallback, caching, and usage accounting are future steps.
 
 ## Check

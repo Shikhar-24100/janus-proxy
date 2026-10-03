@@ -7,8 +7,8 @@ if (Test-Path -LiteralPath $configPath) {
         $line = $line.Trim()
         if ($line -eq '' -or $line.StartsWith('#')) { continue }
         $parts = $line.Split('=', 2)
-        if ($parts.Length -ne 2 -or $parts[0].Trim() -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY')) {
-            throw 'The .env file only supports OPENAI_BASE_URL and OPENAI_API_KEY in NAME=value format.'
+        if ($parts.Length -ne 2 -or $parts[0].Trim() -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY', 'JANUS_API_KEY')) {
+            throw 'The .env file only supports OPENAI_BASE_URL, OPENAI_API_KEY, and JANUS_API_KEY in NAME=value format.'
         }
         [Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim(), 'Process')
     }
