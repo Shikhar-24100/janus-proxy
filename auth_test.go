@@ -89,7 +89,7 @@ func TestAuthenticatedRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := newMux(provider, "janus-test-key")
+	mux := newMux(provider, "janus-test-key", &stubLimiter{decision: rateDecision{allowed: true}})
 	health := httptest.NewRecorder()
 	mux.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if health.Code != 200 || calls.Load() != 0 {

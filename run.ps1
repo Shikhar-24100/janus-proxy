@@ -7,8 +7,8 @@ if (Test-Path -LiteralPath $configPath) {
         $line = $line.Trim()
         if ($line -eq '' -or $line.StartsWith('#')) { continue }
         $parts = $line.Split('=', 2)
-        if ($parts.Length -ne 2 -or $parts[0].Trim() -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY', 'JANUS_API_KEY')) {
-            throw 'The .env file only supports OPENAI_BASE_URL, OPENAI_API_KEY, and JANUS_API_KEY in NAME=value format.'
+        if ($parts.Length -ne 2 -or $parts[0].Trim() -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY', 'JANUS_API_KEY', 'REDIS_URL', 'RPM_LIMIT')) {
+            throw 'The .env file contains an unsupported setting or invalid NAME=value format.'
         }
         [Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim(), 'Process')
     }
@@ -17,14 +17,15 @@ if (Test-Path -LiteralPath $configPath) {
 $goPath = Join-Path $PSScriptRoot '.tools\go\bin\go.exe'
 if (-not (Test-Path -LiteralPath $goPath)) {
     $goCommand = Get-Command go -ErrorAction SilentlyContinue
-    if (-not $goCommand) { throw 'Go was not found. Install Go 1.22 or newer.' }
+    if (-not $goCommand) { throw 'Go was not found. Install Go 1.24 or newer.' }
     $goPath = $goCommand.Source
 }
 
 $env:GOCACHE = Join-Path $PSScriptRoot '.cache\go-build'
+$env:GOMODCACHE = Join-Path $PSScriptRoot '.cache\go-mod'
 Push-Location $PSScriptRoot
 try {
-    & $goPath run .
+    & $goPath run -p 1 .
     if ($LASTEXITCODE -ne 0) { throw 'Janus exited with an error. Check the server output above.' }
 } finally {
     Pop-Location

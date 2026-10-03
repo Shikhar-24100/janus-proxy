@@ -3,20 +3,36 @@
 A Go LLM gateway built one working step at a time.
 
 Currently supports a local health endpoint and streaming or non-streaming chat requests to
-one OpenAI-compatible upstream. No external Go dependencies.
+one OpenAI-compatible upstream, client authentication, and Redis request quotas.
 
 ## Run
 
-Requires Go 1.22 or newer. In PowerShell:
+Requires Go 1.24 or newer and Redis. Our local Go installation already meets this.
+For this Windows setup, Ubuntu WSL already has Redis installed. First open a
+terminal and keep it running:
+
+```powershell
+.\start-redis.ps1
+```
+
+That script runs a dedicated, ephemeral Redis on loopback port 6380. It leaves
+existing Redis instances alone and keeps WSL active for localhost forwarding.
+Stopping or restarting this development Redis loses its quota state. For another
+Redis deployment, configure `REDIS_URL` instead of using this script.
+
+If Windows reports low memory or an insufficient paging file while compiling,
+use `$env:GOMAXPROCS = '1'` before running the local startup script. For checks,
+use `go test -p 1 ./...` and `go vet -p 1 ./...` to reduce build concurrency.
+This is a local development workaround, not a production performance setting.
 
 For local Groq setup, copy `.env.example` to `.env`, set your provider key and
-your separate `JANUS_API_KEY` there, and run:
+your separate `JANUS_API_KEY` there, and run in a second terminal:
 
 ```powershell
 .\run.ps1
 ```
 
-The script loads the three settings from `.env` (overriding values in that terminal)
+The script loads supported settings from `.env` (overriding values in that terminal)
 and uses the project-local Go toolchain if available, otherwise Go from PATH.
 The `.env` format is plain `NAME=value`, without quotes or inline comments.
 The real `.env` is ignored by Git; `.env.example` contains placeholders only.
@@ -79,6 +95,38 @@ An unsaved editor tab can show an older version of a file changed on disk.
 Copy any notes or edits you want to keep, then use `File: Revert File` on that
 tab to load the saved version. Saving the stale tab instead would overwrite
 the newer file on disk.
+
+## Redis request rate limiting
+
+`REDIS_URL` selects Redis (default `redis://127.0.0.1:6379/0`; our local `.env`
+uses port 6380). `RPM_LIMIT` defaults to 60 and must be a positive integer up to
+1000000. Janus checks Redis at startup and refuses to start if it cannot connect.
+
+After authentication, a token bucket in Redis controls admission. The bucket
+holds up to `RPM_LIMIT` request slots and refills that many per minute. At 60 RPM,
+an idle bucket permits a burst of 60 calls and then replenishes one slot per
+second. This is an average refill rate plus burst capacity, not a strict cap in
+every rolling 60-second interval. These slots are request permits, not LLM tokens.
+
+A Lua script uses Redis's clock and atomically reads, refills, checks, and updates
+the bucket. All gateway instances using the same Redis database and configured
+client key share the same bucket. The Redis key contains a SHA-256 fingerprint,
+not the raw client key. Idle buckets expire after two minutes.
+
+Exhausted quota returns JSON 429 with `Retry-After` in whole seconds. Successful
+checks include `X-RateLimit-Limit` and `X-RateLimit-Remaining`. Redis failures
+return 503 before calling the provider. Admission checks have a 750 ms budget;
+mutating commands are not automatically retried because they might have executed.
+
+Unauthenticated requests and `/health` do not consume quota. Authenticated chat
+attempts do consume quota, including malformed bodies and upstream failures.
+Streaming consumes one request slot at admission, not one per event. TPM token
+reservations and refunds will be a separate step.
+
+Redis provides shared state across Janus restarts. Restarting this ephemeral
+development Redis resets that state. Production persistence, replication, and
+outage policies need further work. Redis limiter reference:
+[Redis rate limiter documentation](https://redis.io/docs/latest/develop/use-cases/rate-limiter/).
 
 ## Send a request
 
@@ -155,7 +203,8 @@ interrupted streams and errors. Provider protocol:
 ## Current request flow
 
 ```text
-Client -> router -> authentication -> JSON decoding -> validation -> provider HTTP call
+Client -> router -> authentication -> Redis RPM check -> JSON decoding
+       -> validation -> provider HTTP call
        <- provider's JSON response and HTTP status <-
 ```
 
@@ -172,7 +221,7 @@ for cancellation. JSON provider errors keep their status (including 429) and
 `Retry-After`; network failures return 502 and timeouts return 504. Redirects
 are rejected. Non-streaming responses are buffered before sending to the client.
 
-This is a local development gateway. Tenant management, quotas,
+This is a local development gateway. Tenant management, TPM quotas,
 fallback, caching, and usage accounting are future steps.
 
 ## Check
@@ -180,6 +229,14 @@ fallback, caching, and usage accounting are future steps.
 ```powershell
 go test ./...
 go vet ./...
+```
+
+To also exercise the real Redis script and concurrent admission across two
+gateway clients, start Redis, then run:
+
+```powershell
+$env:REDIS_TEST_URL = 'redis://127.0.0.1:6380/0'
+go test -timeout 30s ./...
 ```
 
 Replace `go` with `.\.tools\go\bin\go.exe` if using the local toolchain.

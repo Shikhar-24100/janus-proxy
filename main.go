@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -21,7 +23,18 @@ func main() {
 		log.Println("OPENAI_API_KEY is unset; chat requests will return 503")
 	}
 
-	mux := newMux(provider, janusKey)
+	limiter, err := newRateLimiter(os.Getenv("REDIS_URL"), os.Getenv("RPM_LIMIT"), janusKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer limiter.client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err = limiter.client.Ping(ctx).Err()
+	cancel()
+	if err != nil {
+		log.Fatal("Cannot connect to Redis; check REDIS_URL and start Redis")
+	}
+	mux := newMux(provider, janusKey, limiter)
 
 	log.Println("Janus proxy listening on http://localhost:8080")
 	if err := http.ListenAndServe("127.0.0.1:8080", mux); err != nil {
@@ -29,10 +42,11 @@ func main() {
 	}
 }
 
-func newMux(provider *Provider, janusKey string) *http.ServeMux {
+func newMux(provider *Provider, janusKey string, limiter requestLimiter) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler)
-	mux.Handle("POST /v1/chat/completions", requireAPIKey(janusKey, http.HandlerFunc(provider.chatHandler)))
+	chat := limitRequests(limiter, http.HandlerFunc(provider.chatHandler))
+	mux.Handle("POST /v1/chat/completions", requireAPIKey(janusKey, chat))
 	return mux
 }
 
