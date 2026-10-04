@@ -80,8 +80,9 @@ ephemeral, so restarting it clears state.
 
 Authenticated chat logs include `tenant_id`; rejected credentials have no trusted
 tenant ID. Keys, prompts and answers remain excluded. Metrics retain fixed labels
-without tenant IDs, avoiding unbounded series growth. Durable tenant analytics
-and billing remain future work. Breakers, provider credentials, connection pools,
+without tenant IDs, avoiding unbounded series growth. The optional PostgreSQL
+pipeline supplies durable tenant usage history; lossless billing remains future work.
+Breakers, provider credentials, connection pools,
 and gateway capacity are shared: separate quotas do not eliminate every source
 of resource contention between tenants.
 

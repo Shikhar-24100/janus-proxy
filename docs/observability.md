@@ -44,6 +44,8 @@ Total duration includes upstream generation, slow client writes, and bounded
 Redis reconciliation. It is not isolated proxy overhead; a benchmark against
 direct provider calls is still needed to assess the 5-10 ms overhead goal.
 Provider attempt durations are present in request logs.
+Duration is captured before optional durable usage enqueue, so its bounded
+handoff latency is not included in that measurement.
 
 ## Counters, gauges, and histograms
 
@@ -90,6 +92,8 @@ The queue holds 256 completed request events. Request handlers never wait for
 console writes. If it fills, drop the event and increment `janus_log_dropped_total`;
 metrics still update. A writer failure increments `janus_log_write_errors_total`.
 This is best-effort operational logging, not durable billing or a message broker.
+Optional usage storage has a separate persistent Redis queue and PostgreSQL worker;
+it does not rely on this console-log channel. See [usage storage](usage-storage.md).
 
 ## Access and limits
 
@@ -100,11 +104,12 @@ Unauthorized chat requests do count as failed chat requests.
 
 Logs exclude prompts, answers, client headers, provider keys, request bodies,
 URLs, and model strings. Metrics use fixed internal labels: no request IDs,
-keys, prompts, or arbitrary models become labels. No new dependency is required.
+keys, prompts, or arbitrary models become labels. Console logs and metrics use
+the standard library; optional usage persistence adds pgx for PostgreSQL.
 Registry locks protect short updates and snapshots; provider breaker locks are
 held only while reading their state. Metrics reset when Janus restarts and are
-separate for each process. No durable usage database, dollar pricing, dashboards,
-or tracing backend has been added.
+separate for each process. Optional PostgreSQL history persists across restarts.
+Dollar pricing, dashboards and a tracing backend remain future work.
 
 Files: `telemetry.go` owns logs, metrics, and the HTTP wrapper; `provider.go`
 records attempts; `stream.go` records flush/completion; `tokens.go` validates

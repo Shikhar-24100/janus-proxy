@@ -5,8 +5,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -63,12 +65,50 @@ func main() {
 		log.Fatal(err)
 	}
 	observability := newTelemetry(os.Stderr)
+	databaseURL, queueURL := os.Getenv("DATABASE_URL"), os.Getenv("USAGE_REDIS_URL")
+	if (databaseURL == "") != (queueURL == "") {
+		log.Fatal("Set both DATABASE_URL and USAGE_REDIS_URL, or leave both empty to disable usage storage")
+	}
+	if databaseURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		store, err := newPostgresUsageStore(ctx, databaseURL)
+		cancel()
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer store.pool.Close()
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		pipeline, err := newUsagePipeline(ctx, queueURL, store)
+		cancel()
+		if err != nil {
+			log.Fatal(err)
+		}
+		observability.usage = pipeline
+		pipeline.start()
+		defer pipeline.close()
+	}
 	mux := newTenantMux(provider, janusKey, registry, observability)
 
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	server := &http.Server{Addr: "127.0.0.1:8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-stopCtx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if server.Shutdown(ctx) != nil {
+			_ = server.Close()
+		}
+	}()
 	log.Println("Janus proxy listening on http://localhost:8080")
-	if err := http.ListenAndServe("127.0.0.1:8080", mux); err != nil {
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	stop()
+	<-shutdownDone
+	// Accepted usage events remain in Redis even if the worker stops before draining.
 }
 
 func newMux(provider *Provider, janusKey string, limiter requestLimiter) *http.ServeMux {

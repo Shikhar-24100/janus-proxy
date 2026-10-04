@@ -46,6 +46,9 @@ Handler completion -> settle actual usage in Redis
   | unknown usage -> keep reservation until original window expires
   v
 Update metrics -> enqueue JSON request log -> background console writer
+               -> bounded persistent Redis usage enqueue (separate 6381 server)
+                  -> background worker -> PostgreSQL request + attempt transaction
+                  -> commit -> acknowledge/delete queue entry
 
 GET /metrics + Janus key -> in-memory counters/histograms + circuit snapshots
 ```
@@ -73,7 +76,7 @@ heuristic; accurate model tokenizers remain future work.
 
 ## Rough progress estimate
 
-About **60% of the first production-focused version** after adding tenant management, exact caching,
+About **65% of the first production-focused version** after adding durable usage storage, tenant management, exact caching,
 logs and metrics. This is an effort estimate, not a measured percentage or
 production-readiness claim. Optional semantic caching is outside this scope.
 
@@ -89,13 +92,13 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | Exact caching | Opt-in non-streaming primary answers; Redis TTL and metrics |
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Startup registry, isolated quotas/cache, rotation and disabling; dollar budgets and live administration remain |
-| Durable usage pipeline | Event delivery and analytics storage still needed |
+| Durable usage pipeline | Persistent Redis Stream, retrying PostgreSQL worker, deduplication and daily reports; pre-enqueue crash gaps remain |
 | Operations | Request logs and metrics built; load tests, measured overhead, hardening remain |
 
 Tests cover concurrency, refunds, duplicate/late settlement, underestimated
 usage, missing usage, fragmented SSE, and output bounds. Settlement is currently
 a bounded call at handler completion, not a durable worker. Crash recovery,
-persistence, replication, and durable billing remain future work.
+persistence for quota Redis, replication, and lossless billing remain future work.
 
 See [token accounting maths](token-accounting.md) for worked examples.
 See [circuit breaker design](circuit-breaker.md) for provider failure handling.
@@ -103,3 +106,4 @@ See [fallback routing](fallback-routing.md) for multi-attempt accounting.
 See [observability](observability.md) for TTFT, logs, metrics, and limitations.
 See [caching](caching.md) for eligibility, quota behavior, and test commands.
 See [tenants](tenants.md) for identity, configuration, isolation, and rotation.
+See [usage storage](usage-storage.md) for PostgreSQL, async workers and reliability limits.

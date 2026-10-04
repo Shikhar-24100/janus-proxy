@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -100,10 +101,11 @@ type telemetry struct {
 	sequence     atomic.Uint64
 	idPrefix     string
 	breakers     map[string]*circuitBreaker
+	usage        *usagePipeline
 }
 
 func newTelemetry(writer io.Writer) *telemetry {
-	t := &telemetry{requests: make(map[requestMetric]uint64), attempts: make(map[attemptMetric]uint64), idPrefix: strconv.FormatInt(time.Now().UnixNano(), 16), breakers: make(map[string]*circuitBreaker)}
+	t := &telemetry{requests: make(map[requestMetric]uint64), attempts: make(map[attemptMetric]uint64), idPrefix: rand.Text(), breakers: make(map[string]*circuitBreaker)}
 	if writer != nil {
 		t.queue, t.done = make(chan requestEvent, 256), make(chan struct{})
 		go func() {
@@ -263,6 +265,9 @@ func (t *telemetry) record(event requestEvent, fallback bool) {
 			t.dropped.Add(1)
 		}
 	}
+	if t.usage != nil {
+		t.usage.publish(event)
+	}
 }
 
 func writeHistogram(out *strings.Builder, name, help string, h latencyHistogram) {
@@ -308,6 +313,13 @@ func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	writeHistogram(&out, "janus_ttft_seconds", "Time from handler entry to flushing the first recognized text delta.", t.ttft)
 	t.mu.Unlock()
 	fmt.Fprintf(&out, "# HELP janus_log_dropped_total Request logs dropped when the queue is full.\n# TYPE janus_log_dropped_total counter\njanus_log_dropped_total %d\n# HELP janus_log_write_errors_total Failed JSON log writes.\n# TYPE janus_log_write_errors_total counter\njanus_log_write_errors_total %d\n", t.dropped.Load(), t.logErrors.Load())
+	if p := t.usage; p != nil {
+		fmt.Fprintf(&out, "# HELP janus_usage_enqueued_total Confirmed usage queue handoffs.\n# TYPE janus_usage_enqueued_total counter\njanus_usage_enqueued_total %d\n", p.queued.Load())
+		fmt.Fprintf(&out, "# HELP janus_usage_enqueue_errors_total Usage events not confirmed in queue.\n# TYPE janus_usage_enqueue_errors_total counter\njanus_usage_enqueue_errors_total %d\n", p.enqueueErr.Load())
+		fmt.Fprintf(&out, "# HELP janus_usage_persisted_total Saved and acknowledged deliveries, including deduplicated retries.\n# TYPE janus_usage_persisted_total counter\njanus_usage_persisted_total %d\n", p.persisted.Load())
+		fmt.Fprintf(&out, "# HELP janus_usage_worker_errors_total Worker read, save or acknowledgement failures.\n# TYPE janus_usage_worker_errors_total counter\njanus_usage_worker_errors_total %d\n", p.workerErr.Load())
+		fmt.Fprintf(&out, "# HELP janus_usage_invalid_events_total Invalid entries encountered, including repeat encounters.\n# TYPE janus_usage_invalid_events_total counter\njanus_usage_invalid_events_total %d\n", p.invalid.Load())
+	}
 	fmt.Fprintln(&out, "# HELP janus_circuit_state Provider circuit state: closed=0, open=1, half-open=2.\n# TYPE janus_circuit_state gauge")
 	for route, breaker := range t.breakers {
 		breaker.mu.Lock()

@@ -1,0 +1,285 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+func sampleUsageEvent() requestEvent {
+	prompt, completion, total := int64(20), int64(30), int64(50)
+	return requestEvent{TenantID: "test-" + rand.Text(), RequestID: rand.Text(), Time: time.Now().UTC(), Event: "chat_request", Route: "primary", Status: 200, Outcome: "success", Cache: "BYPASS", Duration: 2,
+		Attempts: []attemptObservation{{Route: "primary", Outcome: "success", Status: 200, Duration: 1, Usage: &tokenUsage{Prompt: &prompt, Completion: &completion, Total: &total}}}}
+}
+
+type failingUsageStore struct {
+	fail  atomic.Bool
+	calls atomic.Int32
+	mu    sync.Mutex
+	saved map[string]requestEvent
+}
+
+func (store *failingUsageStore) Save(ctx context.Context, event requestEvent) error {
+	store.calls.Add(1)
+	if store.fail.Load() {
+		return errors.New("database unavailable")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.saved == nil {
+		store.saved = make(map[string]requestEvent)
+	}
+	store.saved[event.RequestID] = event
+	return nil
+}
+
+func queueFixture(t *testing.T, store usageStore) *usagePipeline {
+	t.Helper()
+	l := testQuota(t, "60", 60000)
+	p := &usagePipeline{client: l.client, store: store, stream: "janus:usage:test:" + rand.Text(), group: usageGroup, consumer: rand.Text(), claimIdle: time.Millisecond, capacity: 100}
+	if err := p.initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if p.cancel != nil {
+			p.cancel()
+			<-p.done
+		}
+		p.client.Del(context.Background(), p.stream)
+	})
+	return p
+}
+
+func readUsageMessage(t *testing.T, p *usagePipeline) redis.XMessage {
+	t.Helper()
+	streams, err := p.client.XReadGroup(context.Background(), &redis.XReadGroupArgs{Group: p.group, Consumer: "crashed-consumer", Streams: []string{p.stream, ">"}, Count: 1, Block: -1}).Result()
+	if err != nil || len(streams) != 1 || len(streams[0].Messages) != 1 {
+		t.Fatalf("read usage entry: %v", err)
+	}
+	return streams[0].Messages[0]
+}
+
+func TestRedisUsageFailureRecoveryAndCapacity(t *testing.T) {
+	store := &failingUsageStore{}
+	store.fail.Store(true)
+	p := queueFixture(t, store)
+	p.capacity = 1
+	event := sampleUsageEvent()
+	if err := p.enqueue(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.enqueue(context.Background(), sampleUsageEvent()); err == nil {
+		t.Fatal("full queue discarded backlog to admit another event")
+	}
+	message := readUsageMessage(t, p)
+	if err := p.process(context.Background(), message); err == nil {
+		t.Fatal("failed database save was acknowledged")
+	}
+	pending, err := p.client.XPending(context.Background(), p.stream, p.group).Result()
+	if err != nil || pending.Count != 1 {
+		t.Fatal("failed entry not retained pending")
+	}
+	// Simulate restart: new consumer recovers the previous consumer's pending entry.
+	store.fail.Store(false)
+	p.consumer = rand.Text()
+	time.Sleep(5 * time.Millisecond)
+	messages, _, err := p.client.XAutoClaim(context.Background(), &redis.XAutoClaimArgs{Stream: p.stream, Group: p.group, Consumer: p.consumer, Start: "0-0", MinIdle: time.Millisecond, Count: 1}).Result()
+	if err != nil || len(messages) != 1 || messages[0].ID != message.ID {
+		t.Fatal("new worker failed to reclaim pending usage")
+	}
+	if err := p.process(context.Background(), messages[0]); err != nil {
+		t.Fatal(err)
+	}
+	length, err := p.client.XLen(context.Background(), p.stream).Result()
+	if err != nil || length != 0 || p.persisted.Load() != 1 {
+		t.Fatal("committed entry not removed from queue")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.saved) != 1 || store.saved[event.RequestID].TenantID != event.TenantID {
+		t.Fatal("worker changed usage identity")
+	}
+}
+
+func TestRedisUsageWorkerRetriesWithoutBlockingPublisher(t *testing.T) {
+	store := &failingUsageStore{}
+	store.fail.Store(true)
+	p := queueFixture(t, store)
+	p.start()
+	p.publish(sampleUsageEvent())
+	deadline := time.Now().Add(3 * time.Second)
+	for store.calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if store.calls.Load() == 0 {
+		t.Fatal("background worker never attempted database write")
+	}
+	// Publishing succeeds while database writes fail; it does not call the store.
+	p.publish(sampleUsageEvent())
+	if p.queued.Load() != 2 || p.enqueueErr.Load() != 0 {
+		t.Fatal("database outage blocked queue handoff")
+	}
+	store.fail.Store(false)
+	deadline = time.Now().Add(4 * time.Second)
+	for p.persisted.Load() != 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p.persisted.Load() != 2 || p.workerErr.Load() == 0 {
+		t.Fatal("worker did not retry and drain after database recovery")
+	}
+}
+
+func TestRedisUsageMalformedEntryAndEnqueueMetrics(t *testing.T) {
+	p := queueFixture(t, &failingUsageStore{})
+	p.client.XAdd(context.Background(), &redis.XAddArgs{Stream: p.stream, Values: map[string]any{"event": "not JSON"}})
+	message := readUsageMessage(t, p)
+	if !errors.Is(p.process(context.Background(), message), errInvalidQueuedUsage) || p.invalid.Load() != 1 {
+		t.Fatal("malformed entry not identified")
+	}
+	if pending, err := p.client.XPending(context.Background(), p.stream, p.group).Result(); err != nil || pending.Count != 1 {
+		t.Fatal("malformed entry silently discarded")
+	}
+	// Queue capacity errors are visible; unauthenticated logs never enter usage storage.
+	p.capacity = 1
+	p.publish(sampleUsageEvent())
+	p.publish(requestEvent{})
+	if p.enqueueErr.Load() != 1 || p.queued.Load() != 0 {
+		t.Fatal("enqueue failure or unauthenticated event incorrectly accounted")
+	}
+}
+
+func postgresFixture(t *testing.T) *postgresUsageStore {
+	t.Helper()
+	url := os.Getenv("POSTGRES_TEST_URL")
+	if url == "" {
+		t.Skip("set POSTGRES_TEST_URL for PostgreSQL integration tests")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	store, err := newPostgresUsageStore(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.pool.Close)
+	return store
+}
+
+func cleanupUsageRows(t *testing.T, store *postgresUsageStore, tenantID string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, err := store.pool.Exec(ctx, `DELETE FROM janus_usage_attempts WHERE request_id IN (SELECT request_id FROM janus_usage_requests WHERE tenant_id=$1)`, tenantID)
+		if err == nil {
+			_, err = store.pool.Exec(ctx, `DELETE FROM janus_usage_requests WHERE tenant_id=$1`, tenantID)
+		}
+		if err != nil {
+			t.Error("cannot clean test-owned usage rows")
+		}
+	})
+}
+
+func TestPostgresUsageDeduplicationAndDailyReport(t *testing.T) {
+	store := postgresFixture(t)
+	event := sampleUsageEvent()
+	event.Route = "fallback"
+	event.Attempts = append([]attemptObservation{{Route: "primary", Outcome: "failure", Status: 503, Duration: 1}}, event.Attempts...)
+	event.Attempts[1].Route = "fallback"
+	cleanupUsageRows(t, store, event.TenantID)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := store.Save(ctx, event); err != nil {
+				t.Error("concurrent delivery failed")
+			}
+		}()
+	}
+	wg.Wait()
+	cacheHit := event
+	cacheHit.RequestID, cacheHit.Route, cacheHit.Cache, cacheHit.Attempts = rand.Text(), "cache", "HIT", nil
+	if err := store.Save(context.Background(), cacheHit); err != nil {
+		t.Fatal(err)
+	}
+	var unknown int
+	if err := store.pool.QueryRow(context.Background(), `SELECT count(*) FROM janus_usage_attempts WHERE request_id=$1 AND total_tokens IS NULL`, event.RequestID).Scan(&unknown); err != nil || unknown != 1 {
+		t.Fatal("unknown usage became zero")
+	}
+	query, err := os.ReadFile("queries/daily_usage.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.pool.Query(context.Background(), string(query))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var day time.Time
+		var tenant string
+		var requests, hits, prompt, completion, total, missing int64
+		if err := rows.Scan(&day, &tenant, &requests, &hits, &prompt, &completion, &total, &missing); err != nil {
+			t.Fatal(err)
+		}
+		if tenant == event.TenantID {
+			found = true
+			if requests != 2 || hits != 1 || prompt != 20 || completion != 30 || total != 50 || missing != 1 {
+				t.Fatal("daily report doubled fallback requests, duplicate deliveries or cache-hit tokens")
+			}
+		}
+	}
+	if rows.Err() != nil || !found {
+		t.Fatal("daily report missing test tenant")
+	}
+}
+
+func TestPostgresUsageCommitBeforeAcknowledgement(t *testing.T) {
+	store := postgresFixture(t)
+	p := queueFixture(t, store)
+	event := sampleUsageEvent()
+	cleanupUsageRows(t, store, event.TenantID)
+	if err := p.enqueue(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	message := readUsageMessage(t, p)
+	// Simulate a database commit followed by worker crash before Redis XACK.
+	if err := store.Save(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.process(context.Background(), message); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := store.pool.QueryRow(context.Background(), `SELECT count(*) FROM janus_usage_requests WHERE request_id=$1`, event.RequestID).Scan(&count); err != nil || count != 1 {
+		t.Fatal("replayed committed event duplicated storage")
+	}
+	if pending, err := p.client.XPending(context.Background(), p.stream, p.group).Result(); err != nil || pending.Count != 0 {
+		t.Fatal("replayed committed event not acknowledged")
+	}
+}
+
+func TestUsageEventValidation(t *testing.T) {
+	event := sampleUsageEvent()
+	if err := validateUsageEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	event.Attempts[0].Usage.Total = nil
+	if err := validateUsageEvent(event); err == nil {
+		t.Fatal("partial usage accepted")
+	}
+	if _, err := decodeUsageEvent(strings.Repeat("x", (16<<10)+1)); err == nil {
+		t.Fatal("oversized queue payload accepted")
+	}
+}

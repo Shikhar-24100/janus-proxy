@@ -5,6 +5,7 @@ A Go LLM gateway built one working step at a time.
 Currently supports a local health endpoint and streaming or non-streaming chat requests to
 an OpenAI-compatible primary and optional fallback, client authentication, and Redis RPM/TPM quotas
 with provider usage reconciliation.
+Optional persistent Redis Streams and a PostgreSQL worker retain tenant usage history.
 
 Provider calls also use an in-memory circuit breaker to stop repeatedly calling
 an upstream that is failing.
@@ -370,7 +371,7 @@ It never loads `.env` itself or prints credentials.
 See [fallback design and accounting examples](docs/fallback-routing.md).
 
 This is a local development gateway. Accurate tokenization,
-wider provider routing, and durable usage analytics are future steps.
+wider provider routing, richer analytics, and lossless billing are future steps.
 
 ## Exact response caching
 
@@ -412,6 +413,22 @@ stream without completion is recorded as interrupted. Logs go through a bounded
 instead of delaying chat. This is not durable billing. Total latency includes
 provider generation and quota settlement, rather than isolated proxy overhead.
 See [observability notes and examples](docs/observability.md).
+
+## Durable usage storage
+
+Set both `DATABASE_URL` and `USAGE_REDIS_URL` to enable storage, or leave both
+empty to disable it. Our local setup uses PostgreSQL in WSL on 5432 and a separate
+persistent Redis on 6381. Start `.\start-usage.ps1` in another terminal before
+Janus; keep the existing quota/cache Redis on 6380 running too.
+
+Completed authenticated requests enqueue a bounded usage event. A background
+Go worker saves the request and provider attempts transactionally, deduplicates
+replayed request IDs, then acknowledges the queue entry. Database outages retain
+queued events for retry. Cache hits create zero new provider token usage;
+unknown usage stays NULL. `.\usage-report.ps1` shows daily totals per tenant.
+
+Enqueue failures are visible in logs/metrics and can leave accounting gaps;
+crashes before enqueue are not covered. See [worker design, setup and limitations](docs/usage-storage.md).
 
 ## Check
 
