@@ -12,8 +12,8 @@ import (
 
 func main() {
 	janusKey := os.Getenv("JANUS_API_KEY")
-	if strings.TrimSpace(janusKey) == "" {
-		log.Fatal("JANUS_API_KEY must be configured before starting Janus")
+	if janusKey == "" || strings.ContainsAny(janusKey, " \t\r\n") {
+		log.Fatal("JANUS_API_KEY must be configured and contain no whitespace")
 	}
 
 	provider, err := newProvider(os.Getenv("OPENAI_BASE_URL"), os.Getenv("OPENAI_API_KEY"))
@@ -50,12 +50,20 @@ func main() {
 	if err != nil {
 		log.Fatal("Cannot connect to Redis; check REDIS_URL and start Redis")
 	}
-	provider.cache, err = newResponseCache(limiter.client, os.Getenv("CACHE_TTL_SECONDS"), janusKey, provider)
+	enabled := true
+	configs := []tenantConfig{{ID: "default", APIKeyEnv: "JANUS_API_KEY", RPM: limiter.rpm, TPM: limiter.tpm, MaxOutputTokens: limiter.outputLimit, Enabled: &enabled}}
+	if path := os.Getenv("TENANTS_CONFIG"); path != "" {
+		configs, err = readTenantConfigs(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	registry, err := buildTenantRegistry(configs, os.Getenv, limiter, provider, os.Getenv("CACHE_TTL_SECONDS"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	observability := newTelemetry(os.Stderr)
-	mux := newMuxWithTelemetry(provider, janusKey, limiter, observability)
+	mux := newTenantMux(provider, janusKey, registry, observability)
 
 	log.Println("Janus proxy listening on http://localhost:8080")
 	if err := http.ListenAndServe("127.0.0.1:8080", mux); err != nil {
@@ -68,6 +76,17 @@ func newMux(provider *Provider, janusKey string, limiter requestLimiter) *http.S
 }
 
 func newMuxWithTelemetry(provider *Provider, janusKey string, limiter requestLimiter, observability *telemetry) *http.ServeMux {
+	mux := newOperationalMux(provider, janusKey, observability)
+	var cache *responseCache
+	if provider != nil {
+		cache = provider.cache
+	}
+	chat := limitRequests(limiter, http.HandlerFunc(provider.chatHandler), cache)
+	mux.Handle("POST /v1/chat/completions", observability.observe(requireAPIKey(janusKey, chat)))
+	return mux
+}
+
+func newOperationalMux(provider *Provider, janusKey string, observability *telemetry) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler)
 	if provider != nil {
@@ -77,12 +96,6 @@ func newMuxWithTelemetry(provider *Provider, janusKey string, limiter requestLim
 		}
 	}
 	mux.Handle("GET /metrics", requireAPIKey(janusKey, http.HandlerFunc(observability.serveMetrics)))
-	var cache *responseCache
-	if provider != nil {
-		cache = provider.cache
-	}
-	chat := limitRequests(limiter, http.HandlerFunc(provider.chatHandler), cache)
-	mux.Handle("POST /v1/chat/completions", observability.observe(requireAPIKey(janusKey, chat)))
 	return mux
 }
 

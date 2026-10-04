@@ -7,10 +7,10 @@ it is not embedded inside Go. Groq is the remote LLM provider.
 Client (PowerShell, curl, browser app)
   | POST /v1/chat/completions + Janus API key
   v
-Router -> telemetry wrapper (request ID, timer) -> authentication
+Router -> telemetry wrapper (request ID, timer) -> tenant authentication
   | missing/wrong key -> 401; public /health bypasses quotas
   v
-Decode and validate JSON; choose output allowance
+Attach trusted tenant to context; validate JSON and tenant output allowance
   | invalid -> 400; oversized body -> 413
   v
 Estimate input + output allowance
@@ -54,7 +54,7 @@ RPM and TPM govern admission, not response event speed or event count. Admitted
 streams are forwarded subject to client cancellation, provider failure, timeout,
 and the output allowance sent to the provider.
 
-Redis state is scoped to the shared Janus key's SHA-256 fingerprint. One Lua
+Redis quota state is scoped to a stable tenant ID's SHA-256 fingerprint. One Lua
 script checks both quotas atomically across gateway instances for ordinary calls.
 Opted-in cache calls split RPM and TPM admission so hits need no TPM; a miss
 rejected by TPM still spends RPM. RPM holds 60 permits by default and refills at one per
@@ -73,7 +73,7 @@ heuristic; accurate model tokenizers remain future work.
 
 ## Rough progress estimate
 
-About **55% of the first production-focused version** after adding exact caching,
+About **60% of the first production-focused version** after adding tenant management, exact caching,
 logs and metrics. This is an effort estimate, not a measured percentage or
 production-readiness claim. Optional semantic caching is outside this scope.
 
@@ -82,13 +82,13 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | API and validation | Basic text-only subset |
 | Provider calls | Primary + second Groq key fallback; live JSON/SSE verified |
 | SSE streaming | Forwarding, flushing, cancellation, failure tests |
-| Authentication | One shared key; no tenant registry |
+| Authentication | Configured tenant keys; separate metrics administrator |
 | RPM | Atomic Redis bucket |
 | TPM | Rolling reservations and actual usage settlement |
 | Tokenization | Byte heuristic; model tokenizer still needed |
 | Exact caching | Opt-in non-streaming primary answers; Redis TTL and metrics |
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
-| Tenant management | Individual keys, budgets, revocation still needed |
+| Tenant management | Startup registry, isolated quotas/cache, rotation and disabling; dollar budgets and live administration remain |
 | Durable usage pipeline | Event delivery and analytics storage still needed |
 | Operations | Request logs and metrics built; load tests, measured overhead, hardening remain |
 
@@ -102,3 +102,4 @@ See [circuit breaker design](circuit-breaker.md) for provider failure handling.
 See [fallback routing](fallback-routing.md) for multi-attempt accounting.
 See [observability](observability.md) for TTFT, logs, metrics, and limitations.
 See [caching](caching.md) for eligibility, quota behavior, and test commands.
+See [tenants](tenants.md) for identity, configuration, isolation, and rotation.

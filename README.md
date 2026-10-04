@@ -82,8 +82,12 @@ a new upstream request with `OPENAI_API_KEY`, rather than forwarding the client'
 Authorization header. Key comparison uses fixed-size SHA-256 hashes and a
 constant-time comparison. Keys are not logged.
 
-This first version has one shared client key. Tenant identities, individual keys,
-rotation, and per-tenant quotas are future work. Authorization headers need HTTPS
+With no tenant configuration, this key identifies tenant `default`. Set
+`TENANTS_CONFIG` to a JSON file to configure individual client keys, independent
+RPM/TPM quotas, output limits and cache scopes. `JANUS_API_KEY` also protects
+administrative metrics; ordinary tenant keys grant chat access only.
+See [tenant configuration and rotation](docs/tenants.md).
+Authorization headers need HTTPS
 when exposing a gateway beyond local development; this server still binds only
 to loopback. Restart Janus after changing its configured key.
 
@@ -115,8 +119,9 @@ every rolling 60-second interval. These slots are request permits, not LLM token
 
 A Lua script uses Redis's clock and atomically reads, refills, checks, and updates
 the bucket. All gateway instances using the same Redis database and configured
-client key share the same bucket. The Redis key contains a SHA-256 fingerprint,
-not the raw client key. Idle buckets expire after two minutes.
+tenant ID share the same bucket. The Redis key contains a SHA-256 fingerprint
+of the stable tenant identity, not its client credential. Idle buckets expire
+after two minutes. Rotating credentials preserves the tenant's quota.
 
 Exhausted quota returns JSON 429 with `Retry-After` in whole seconds. Successful
 checks include `X-RateLimit-Limit` and `X-RateLimit-Remaining`. Redis failures
@@ -364,7 +369,7 @@ sends up to two potentially billed calls, each with a 256-token output cap.
 It never loads `.env` itself or prints credentials.
 See [fallback design and accounting examples](docs/fallback-routing.md).
 
-This is a local development gateway. Tenant management, accurate tokenization,
+This is a local development gateway. Accurate tokenization,
 wider provider routing, and durable usage analytics are future steps.
 
 ## Exact response caching

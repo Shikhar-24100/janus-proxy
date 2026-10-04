@@ -1,0 +1,20 @@
+{
+  "tenants": [
+    {
+      "id": "alice",
+      "api_key_env": "ALICE_JANUS_API_KEY",
+      "rpm": 30,
+      "tpm": 20000,
+      "max_output_tokens": 512,
+      "enabled": true
+    },
+    {
+      "id": "bob",
+      "api_key_env": "BOB_JANUS_API_KEY",
+      "rpm": 60,
+      "tpm": 50000,
+      "max_output_tokens": 1024,
+      "enabled": true
+    }
+  ]
+}

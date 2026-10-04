@@ -28,7 +28,7 @@ temperature, tools, and semantic similarity are not supported by this cache.
 Keys use SHA-256 of the normalized supported request, including model, messages,
 roles, output allowance, and stream settings. JSON spacing and field order do
 not affect matching; changing a message or model does. A separate fingerprint
-isolates the configured Janus key and provider credentials/routing configuration.
+isolates the authenticated tenant ID and provider credentials/routing configuration.
 Raw credentials and prompts do not appear in keys. Response text is stored in
 Redis, so Redis still needs appropriate access controls.
 

@@ -24,6 +24,7 @@ type attemptObservation struct {
 }
 
 type requestTrace struct {
+	tenantID        string
 	started         time.Time
 	route           string
 	stream          bool
@@ -42,6 +43,7 @@ func traceFrom(r *http.Request) *requestTrace {
 }
 
 type requestEvent struct {
+	TenantID        string               `json:"tenant_id,omitempty"`
 	Time            time.Time            `json:"time"`
 	Event           string               `json:"event"`
 	RequestID       string               `json:"request_id"`
@@ -198,7 +200,7 @@ func (t *telemetry) observe(next http.Handler) http.Handler {
 			case status >= 400:
 				outcome = "error"
 			}
-			event := requestEvent{Time: time.Now().UTC(), Event: "chat_request", RequestID: id, Route: trace.route, Status: status, Outcome: outcome, Stream: trace.stream, Duration: float64(time.Since(trace.started)) / float64(time.Millisecond), TTFT: trace.ttft, Attempts: trace.attempts, Cache: trace.cache, CacheWriteError: trace.cacheWriteError}
+			event := requestEvent{TenantID: trace.tenantID, Time: time.Now().UTC(), Event: "chat_request", RequestID: id, Route: trace.route, Status: status, Outcome: outcome, Stream: trace.stream, Duration: float64(time.Since(trace.started)) / float64(time.Millisecond), TTFT: trace.ttft, Attempts: trace.attempts, Cache: trace.cache, CacheWriteError: trace.cacheWriteError}
 			t.record(event, trace.fallback)
 			if panicked != nil {
 				panic(panicked)

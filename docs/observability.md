@@ -73,6 +73,8 @@ TTFT, and at most two provider attempt records with upstream status, outcome,
 duration, and known token usage. Unknown usage is null, not zero.
 
 Logs also include `cache` (HIT/MISS/BYPASS/ERROR) and `cache_write_error`.
+Authenticated requests include the trusted `tenant_id`; rejected credentials
+have no tenant attribution. Tenant IDs are kept out of metric labels.
 A hit selects route `cache` and has no provider attempts. Although its JSON body
 contains the original generation's usage, it adds no fresh provider token usage.
 Duration includes cache operations; non-streaming hits have no TTFT sample.
@@ -91,7 +93,8 @@ This is best-effort operational logging, not durable billing or a message broker
 
 ## Access and limits
 
-`GET /metrics` requires the existing Janus Bearer key. It does not consume RPM/TPM,
+`GET /metrics` requires the administrative `JANUS_API_KEY`. Other tenant keys
+cannot read aggregate metrics. It does not consume RPM/TPM,
 and neither health checks nor metric scrapes generate chat logs or latency samples.
 Unauthorized chat requests do count as failed chat requests.
 
