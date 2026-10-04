@@ -66,6 +66,9 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Set("Authorization", "Bearer "+p.apiKey)
 
+	if state := accountingFrom(r); state != nil {
+		state.attempted = true
+	}
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		p.writeUpstreamError(w, r, err)
@@ -94,6 +97,9 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	}
 
 	// Keep the provider's JSON and status, including errors such as 429.
+	if state := accountingFrom(r); state != nil {
+		state.actual = reportedTokens(responseBody)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if retryAfter := response.Header.Get("Retry-After"); retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)

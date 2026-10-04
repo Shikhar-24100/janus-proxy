@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,6 +29,18 @@ func main() {
 		log.Fatal(err)
 	}
 	defer limiter.client.Close()
+	for name, target := range map[string]*int{"TPM_LIMIT": &limiter.tpm, "MAX_OUTPUT_TOKENS": &limiter.outputLimit} {
+		if setting := os.Getenv(name); setting != "" {
+			value, err := strconv.Atoi(setting)
+			if err != nil || value < 1 || value > 100000000 {
+				log.Fatalf("%s must be a positive integer up to 100000000", name)
+			}
+			*target = value
+		}
+	}
+	if limiter.outputLimit >= limiter.tpm {
+		log.Fatal("MAX_OUTPUT_TOKENS must be less than TPM_LIMIT")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	err = limiter.client.Ping(ctx).Err()
 	cancel()

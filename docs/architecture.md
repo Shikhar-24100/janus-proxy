@@ -1,59 +1,80 @@
 # Janus architecture and progress
 
-The gateway runs on Windows; development Redis runs in Ubuntu WSL.
+Janus runs on Windows. Redis is a separate server in Ubuntu WSL on port 6380;
+it is not embedded inside Go. Groq is the remote LLM provider.
 
 ```text
-Client (PowerShell, curl, or app)
+Client (PowerShell, curl, browser app)
   | POST /v1/chat/completions + Janus API key
   v
-Janus router
-  | /health returns 200 without authentication or Redis admission
+Router -> authentication
+  | missing/wrong key -> 401; public /health bypasses quotas
   v
-Authentication middleware
-  | wrong or missing key -> 401
+Decode and validate JSON; choose output allowance
+  | invalid -> 400; oversized body -> 413
   v
-Request rate-limit middleware <----> Redis token bucket
-  | exhausted -> 429 + Retry-After
-  | Redis unavailable -> 503
+Estimate input + output allowance
+  | individual reservation larger than TPM capacity -> 400
   v
-JSON decoding and validation
-  | invalid input -> 400 / oversized body -> 413
+Atomic quota admission <----> Redis
+  | RPM: refillable request bucket
+  | TPM: rolling 60-second ledger of token charges
+  | exhausted -> 429 + Retry-After; unavailable -> 503
   v
-Provider HTTP client (uses separate Groq key)
-  v
-Groq / one OpenAI-compatible provider
+Provider HTTP client (separate Groq key) -> Groq
   |
   +-> complete JSON -> bounded read -> client response
-  +-> SSE -> read / write / flush -> client stream
+  +-> SSE -> read / observe usage / write / flush -> client stream
+  |
+  v
+Handler completion -> settle actual usage in Redis
+  | unknown usage -> keep reservation until original window expires
 ```
 
-Redis stores request quota state shared across gateway instances, scoped to the
-configured Janus key's fingerprint. The current token bucket holds 60 request
-permits by default and refills at 60 per minute. Authentication runs first, so
-unauthorized requests never reach Redis or Groq. Accepted streaming calls consume
-one request permit each. These permits are not model tokens.
+RPM and TPM govern admission, not response event speed or event count. Admitted
+streams are forwarded subject to client cancellation, provider failure, timeout,
+and the output allowance sent to the provider.
+
+Redis state is scoped to the shared Janus key's SHA-256 fingerprint. One Lua
+script checks both quotas atomically across gateway instances. Rejection spends
+neither quota. RPM holds 60 request permits by default and refills at one per
+second. TPM defaults to 60000 tokens allocated in a rolling admission window.
+
+Each request has a unique ID. Actual usage replaces reserved usage once.
+Duplicate settlement has no effect. Reservations and settled charges age out
+60 seconds after admission. Late responses cannot refund a newer window.
+Long-running calls still belong to their admission window. Idle Redis records
+expire. The development Redis loses state when restarted.
+
+The bounded SSE observer handles events split across network reads. Events,
+chunks, and visible words are not tokens. Provider usage includes reported
+reasoning tokens in completion totals. The first input estimator is a byte
+heuristic; accurate model tokenizers remain future work.
 
 ## Rough progress estimate
 
-About **30% of the first production-focused version**, after adding Redis RPM
-limits. This is a planning estimate based on remaining effort, not a measured
-percentage or a claim of production readiness. The optional semantic cache is
-outside this first version.
+About **40% of the first production-focused version** after token reservations
+and reconciliation. This is an effort estimate, not a measured percentage or
+production-readiness claim. Optional semantic caching is outside this scope.
 
-| Area | Current status |
+| Area | Status |
 | --- | --- |
-| HTTP API and request validation | Basic text-only subset works |
+| API and validation | Basic text-only subset |
 | Provider calls | One compatible upstream; live Groq verified |
 | SSE streaming | Forwarding, flushing, cancellation, failure tests |
-| Client authentication | One shared key; no tenant registry yet |
-| Redis RPM limiting | Atomic shared token bucket; concurrent integration test |
-| TPM and accounting | Not built: estimates, reservations, actual usage settlement |
-| Exact caching | Not built: tenant-safe keys, TTL, successful-response storage |
-| Resilient routing | Not built: capability checks, circuit breakers, safe fallback |
-| Tenant management | Not built: individual keys, budgets, revocation |
-| Durable usage pipeline | Not built: event delivery and analytics storage |
-| Operations and performance | Not built: metrics, load tests, latency measurements, deployment hardening |
+| Authentication | One shared key; no tenant registry |
+| RPM | Atomic Redis bucket |
+| TPM | Rolling reservations and actual usage settlement |
+| Tokenization | Byte heuristic; model tokenizer still needed |
+| Exact caching | Not built |
+| Routing and fallback | Not built |
+| Tenant management | Individual keys, budgets, revocation still needed |
+| Durable usage pipeline | Event delivery and analytics storage still needed |
+| Operations | Metrics, load tests, measured latency, hardening still needed |
 
-Next: explain the Redis bucket, then build token estimation and TPM reservation
-as a separate step. Streaming usage reconciliation must account for cancellations
-and missing provider usage; do not treat SSE chunks as tokens.
+Tests cover concurrency, refunds, duplicate/late settlement, underestimated
+usage, missing usage, fragmented SSE, and output bounds. Settlement is currently
+a bounded call at handler completion, not a durable worker. Crash recovery,
+persistence, replication, and durable billing remain future work.
+
+See [token accounting maths](token-accounting.md) for worked examples.

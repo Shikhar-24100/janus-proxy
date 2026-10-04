@@ -18,12 +18,22 @@ type stubLimiter struct {
 	decision rateDecision
 	err      error
 	calls    int
+	reserved int64
+	settled  []int64
 }
 
 func (s *stubLimiter) Limit() int { return 60 }
-func (s *stubLimiter) Allow(context.Context) (rateDecision, error) {
+func (s *stubLimiter) Reserve(_ context.Context, amount int64) (rateDecision, error) {
 	s.calls++
+	s.reserved = amount
 	return s.decision, s.err
+}
+
+func (s *stubLimiter) TokenLimit() int  { return 60000 }
+func (s *stubLimiter) OutputLimit() int { return 1024 }
+func (s *stubLimiter) Settle(_ context.Context, _ string, actual int64) error {
+	s.settled = append(s.settled, actual)
+	return nil
 }
 
 func TestRateLimitMiddleware(t *testing.T) {
@@ -45,7 +55,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 				w.WriteHeader(204)
 			}))
 			response := httptest.NewRecorder()
-			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(validChatBody)))
 			if response.Code != test.status || called != test.decision.allowed {
 				t.Fatalf("status=%d, next called=%v", response.Code, called)
 			}
@@ -167,10 +177,11 @@ func TestRedisHTTPAdmission(t *testing.T) {
 	}
 	defer limiter.client.Close()
 	defer limiter.client.Del(context.Background(), limiter.key)
-	mux := newMux(nil, key, limiter)
-	// Invalid bodies consume admission slots, but cannot reach the provider.
-	for _, want := range []int{400, 400, 429} {
-		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	provider, _ := newProvider("", "")
+	mux := newMux(provider, key, limiter)
+	// Valid admission consumes RPM; a missing provider key refunds TPM only.
+	for _, want := range []int{503, 503, 429} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(validChatBody))
 		request.Header.Set("Authorization", "Bearer "+key)
 		response := httptest.NewRecorder()
 		mux.ServeHTTP(response, request)

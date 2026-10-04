@@ -12,9 +12,15 @@ import (
 // Structs describe the JSON fields our first version supports.
 // JSON tags connect Go field names to names in the request body.
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	Model               string         `json:"model"`
+	Messages            []Message      `json:"messages"`
+	Stream              bool           `json:"stream"`
+	MaxCompletionTokens *int           `json:"max_completion_tokens,omitempty"`
+	StreamOptions       *StreamOptions `json:"stream_options,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type Message struct {
@@ -23,6 +29,17 @@ type Message struct {
 }
 
 func (p *Provider) chatHandler(w http.ResponseWriter, r *http.Request) {
+	if state := accountingFrom(r); state != nil {
+		p.forwardChat(w, r, state.input)
+		return
+	}
+	input, ok := decodeChatRequest(w, r, 1024)
+	if ok {
+		p.forwardChat(w, r, input)
+	}
+}
+
+func decodeChatRequest(w http.ResponseWriter, r *http.Request, outputLimit int) (ChatRequest, bool) {
 	// Limit the body to 1 MiB before parsing client-controlled JSON.
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	defer r.Body.Close()
@@ -34,7 +51,7 @@ func (p *Provider) chatHandler(w http.ResponseWriter, r *http.Request) {
 	var request ChatRequest
 	if err := decoder.Decode(&request); err != nil {
 		writeDecodeError(w, err)
-		return
+		return ChatRequest{}, false
 	}
 
 	// A request must contain exactly one JSON value.
@@ -44,28 +61,41 @@ func (p *Provider) chatHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeDecodeError(w, err)
 		}
-		return
+		return ChatRequest{}, false
 	}
 
 	if strings.TrimSpace(request.Model) == "" {
 		writeRequestError(w, http.StatusBadRequest, "model is required.")
-		return
+		return ChatRequest{}, false
 	}
 	if len(request.Messages) == 0 {
 		writeRequestError(w, http.StatusBadRequest, "messages must contain at least one message.")
-		return
+		return ChatRequest{}, false
 	}
 	for _, message := range request.Messages {
 		if message.Role != "system" && message.Role != "user" && message.Role != "assistant" {
 			writeRequestError(w, http.StatusBadRequest, "Each role must be system, user, or assistant.")
-			return
+			return ChatRequest{}, false
 		}
 		if strings.TrimSpace(message.Content) == "" {
 			writeRequestError(w, http.StatusBadRequest, "Each message must have non-empty string content.")
-			return
+			return ChatRequest{}, false
 		}
 	}
-	p.forwardChat(w, r, request)
+	if request.MaxCompletionTokens == nil {
+		request.MaxCompletionTokens = &outputLimit
+	}
+	if *request.MaxCompletionTokens < 1 || *request.MaxCompletionTokens > outputLimit {
+		writeRequestError(w, 400, "max_completion_tokens must be positive and no greater than MAX_OUTPUT_TOKENS.")
+		return ChatRequest{}, false
+	}
+	if request.Stream {
+		request.StreamOptions = &StreamOptions{IncludeUsage: true}
+	} else if request.StreamOptions != nil {
+		writeRequestError(w, 400, "stream_options is only supported with stream=true.")
+		return ChatRequest{}, false
+	}
+	return request, true
 }
 
 func writeDecodeError(w http.ResponseWriter, err error) {

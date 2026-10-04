@@ -7,7 +7,7 @@ if (Test-Path -LiteralPath $configPath) {
         $line = $line.Trim()
         if ($line -eq '' -or $line.StartsWith('#')) { continue }
         $parts = $line.Split('=', 2)
-        if ($parts.Length -ne 2 -or $parts[0].Trim() -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY', 'JANUS_API_KEY', 'REDIS_URL', 'RPM_LIMIT')) {
+        if ($parts.Length -ne 2 -or $parts[0].Trim() -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY', 'JANUS_API_KEY', 'REDIS_URL', 'RPM_LIMIT', 'TPM_LIMIT', 'MAX_OUTPUT_TOKENS')) {
             throw 'The .env file contains an unsupported setting or invalid NAME=value format.'
         }
         [Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim(), 'Process')

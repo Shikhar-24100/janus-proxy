@@ -28,15 +28,20 @@ func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, respons
 	// A network read can contain part of an SSE event or several events.
 	// Forward the bytes unchanged; the client assembles complete events.
 	buffer := make([]byte, 32*1024)
+	observer := usageObserver{}
 	for {
 		n, readErr := response.Body.Read(buffer)
 		if n > 0 {
+			observer.Feed(buffer[:n])
 			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
 				abortStream(r, "Could not write stream to client")
 			}
 			flusher.Flush()
 		}
 		if readErr == io.EOF {
+			if state := accountingFrom(r); state != nil && observer.done && !observer.disabled {
+				state.actual = observer.actual
+			}
 			return
 		}
 		if readErr != nil {

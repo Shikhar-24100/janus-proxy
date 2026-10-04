@@ -3,7 +3,8 @@
 A Go LLM gateway built one working step at a time.
 
 Currently supports a local health endpoint and streaming or non-streaming chat requests to
-one OpenAI-compatible upstream, client authentication, and Redis request quotas.
+one OpenAI-compatible upstream, client authentication, and Redis RPM/TPM quotas
+with provider usage reconciliation.
 
 ## Run
 
@@ -78,7 +79,7 @@ Authorization header. Key comparison uses fixed-size SHA-256 hashes and a
 constant-time comparison. Keys are not logged.
 
 This first version has one shared client key. Tenant identities, individual keys,
-rotation, and Redis quotas are future work. Authorization headers need HTTPS
+rotation, and per-tenant quotas are future work. Authorization headers need HTTPS
 when exposing a gateway beyond local development; this server still binds only
 to loopback. Restart Janus after changing its configured key.
 
@@ -102,7 +103,7 @@ the newer file on disk.
 uses port 6380). `RPM_LIMIT` defaults to 60 and must be a positive integer up to
 1000000. Janus checks Redis at startup and refuses to start if it cannot connect.
 
-After authentication, a token bucket in Redis controls admission. The bucket
+After authentication and body validation, a token bucket controls RPM admission. The bucket
 holds up to `RPM_LIMIT` request slots and refills that many per minute. At 60 RPM,
 an idle bucket permits a burst of 60 calls and then replenishes one slot per
 second. This is an average refill rate plus burst capacity, not a strict cap in
@@ -118,15 +119,53 @@ checks include `X-RateLimit-Limit` and `X-RateLimit-Remaining`. Redis failures
 return 503 before calling the provider. Admission checks have a 750 ms budget;
 mutating commands are not automatically retried because they might have executed.
 
-Unauthenticated requests and `/health` do not consume quota. Authenticated chat
-attempts do consume quota, including malformed bodies and upstream failures.
-Streaming consumes one request slot at admission, not one per event. TPM token
-reservations and refunds will be a separate step.
+Unauthenticated requests, invalid bodies, and `/health` do not consume quota.
+Valid admitted chat attempts consume one RPM slot, including upstream failures.
+Streaming consumes one request slot at admission, not one per event. A single
+Lua script admits both RPM and TPM together; rejection consumes neither.
 
 Redis provides shared state across Janus restarts. Restarting this ephemeral
 development Redis resets that state. Production persistence, replication, and
 outage policies need further work. Redis limiter reference:
 [Redis rate limiter documentation](https://redis.io/docs/latest/develop/use-cases/rate-limiter/).
+
+## Token quota and reconciliation
+
+`TPM_LIMIT` defaults to 60000 tokens in a rolling 60-second admission window.
+`MAX_OUTPUT_TOKENS` defaults to 1024 and must be smaller than `TPM_LIMIT`.
+Both settings accept positive integers up to 100000000. Clients can request
+`max_completion_tokens` between 1 and `MAX_OUTPUT_TOKENS`; omission uses that
+configured maximum. Janus sends the allowance to the provider, which can end
+generation at that cap. Quota reconciliation does not cut streams.
+
+Before calling the provider, Janus reserves estimated input plus the output
+allowance. The first estimator uses UTF-8 byte lengths and message overhead.
+It is a heuristic, not a model tokenizer: it often overestimates text and can
+underestimate provider framing. Accurate tokenizers remain future work.
+
+Redis tracks reservations by request ID and admission time. After successful
+responses with valid prompt/completion/total usage, Janus replaces the reserved
+charge with actual usage. Smaller usage releases capacity; larger usage adds
+debt that can block future admissions. Settlement is idempotent. Charges age
+out 60 seconds after admission; late settlement never credits a newer window.
+
+Streams request `stream_options.include_usage`. A bounded SSE observer recognizes
+top-level `usage` and Groq's `x_groq.usage` without changing forwarded bytes.
+Settlement requires clean EOF, `[DONE]`, and valid usage. Missing usage or an
+uncertain upstream failure retains the reservation until it ages out. No
+upstream attempt releases TPM to zero, but the RPM permit remains spent.
+
+Settlement runs at handler completion with a bounded Redis call, including
+after client cancellation. It is not a durable worker pipeline. A crash or
+failed settlement leaves the conservative reservation.
+
+`X-TokenLimit-Limit`, `X-TokenLimit-Remaining`, and `X-TokenLimit-Reserved`
+show admission values before refunds. On rejection, Reserved is the requested
+allowance, not an accepted charge. Exhausted TPM returns 429 with `Retry-After`;
+a single request exceeding total capacity returns 400 so it can be reduced.
+
+See [token accounting maths](docs/token-accounting.md) and the
+[Groq API reference](https://console.groq.com/docs/api-reference).
 
 ## Send a request
 
@@ -192,8 +231,8 @@ to a JSON error. A read/write failure aborts the response without appending a
 fake completion marker. Clients must treat a stream without `[DONE]` as
 incomplete. Client disconnection cancels the upstream request. The current
 60-second timeout applies to the whole provider call, including streaming;
-separate idle and total deadlines are a future refinement. Janus currently
-forwards SSE without interpreting token usage or detecting completion markers.
+separate idle and total deadlines are a future refinement. Janus observes usage
+and completion markers alongside forwarding to settle token reservations.
 
 Tests use a gated fake provider to prove bytes arrive before generation finishes,
 preserve a split UTF-8 character and SSE framing, check cancellation, and check
@@ -203,12 +242,14 @@ interrupted streams and errors. Provider protocol:
 ## Current request flow
 
 ```text
-Client -> router -> authentication -> Redis RPM check -> JSON decoding
-       -> validation -> provider HTTP call
+Client -> router -> authentication -> JSON decoding and validation
+       -> Redis atomic RPM check + TPM reservation -> provider HTTP call
        <- provider's JSON response and HTTP status <-
+       -> reconcile TPM from actual provider usage in Redis
 ```
 
-Supported input fields: `model`, `messages`, and `stream` (defaults to false).
+Supported input fields: `model`, `messages`, `stream` (defaults to false),
+`max_completion_tokens`, and `stream_options` with `include_usage`.
 Messages support `system`, `user`, and `assistant` roles with non-empty string
 content. Other fields, tool calls, and multimodal content are not
 implemented yet. Provider response bodies are forwarded without changing their
@@ -221,8 +262,8 @@ for cancellation. JSON provider errors keep their status (including 429) and
 `Retry-After`; network failures return 502 and timeouts return 504. Redirects
 are rejected. Non-streaming responses are buffered before sending to the client.
 
-This is a local development gateway. Tenant management, TPM quotas,
-fallback, caching, and usage accounting are future steps.
+This is a local development gateway. Tenant management, accurate tokenization,
+fallback, caching, and durable usage analytics are future steps.
 
 ## Check
 

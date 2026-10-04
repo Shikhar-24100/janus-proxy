@@ -1,5 +1,6 @@
 {
   "model": "openai/gpt-oss-20b",
+  "max_completion_tokens": 512,
   "messages": [
     {
       "role": "user",

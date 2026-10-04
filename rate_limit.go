@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -11,47 +12,30 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Redis runs the whole read/refill/check/update operation atomically.
-// Redis time avoids clock differences between gateway instances.
-var requestBucketScript = redis.NewScript(`
-local capacity = tonumber(ARGV[1])
-local period_ms = tonumber(ARGV[2])
-local clock = redis.call('TIME')
-local now_ms = tonumber(clock[1]) * 1000 + tonumber(clock[2]) / 1000
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'updated_ms')
-local tokens = tonumber(state[1]) or capacity
-local updated_ms = tonumber(state[2]) or now_ms
-local elapsed = math.max(0, now_ms - updated_ms)
-tokens = math.min(capacity, tokens + elapsed * capacity / period_ms)
-local allowed = 0
-local retry_ms = 0
-if tokens >= 1 then
-    tokens = tokens - 1
-    allowed = 1
-else
-    retry_ms = math.ceil((1 - tokens) * period_ms / capacity)
-end
-redis.call('HSET', KEYS[1], 'tokens', tokens, 'updated_ms', math.max(now_ms, updated_ms))
-redis.call('PEXPIRE', KEYS[1], math.ceil(period_ms * 2))
-return {allowed, math.floor(tokens), retry_ms}
-`)
-
 type rateDecision struct {
-	allowed    bool
-	remaining  int64
-	retryAfter time.Duration
+	allowed        bool
+	remaining      int64
+	retryAfter     time.Duration
+	tokenRemaining int64
+	reservation    string
+	tokenDenied    bool
 }
 
 type requestLimiter interface {
-	Allow(context.Context) (rateDecision, error)
+	Reserve(context.Context, int64) (rateDecision, error)
+	Settle(context.Context, string, int64) error
 	Limit() int
+	TokenLimit() int
+	OutputLimit() int
 }
 
 type RateLimiter struct {
-	client *redis.Client
-	key    string
-	rpm    int
-	period time.Duration
+	client      *redis.Client
+	key         string
+	rpm         int
+	period      time.Duration
+	tpm         int
+	outputLimit int
 }
 
 func newRateLimiter(redisURL, rpmSetting, janusKey string) (*RateLimiter, error) {
@@ -77,48 +61,72 @@ func newRateLimiter(redisURL, rpmSetting, janusKey string) (*RateLimiter, error)
 	options.ContextTimeoutEnabled = true
 	fingerprint := sha256.Sum256([]byte(janusKey))
 	return &RateLimiter{
-		client: redis.NewClient(options),
-		key:    fmt.Sprintf("janus:rpm:%x", fingerprint),
-		rpm:    rpm,
-		period: time.Minute,
+		client:      redis.NewClient(options),
+		key:         fmt.Sprintf("janus:quota:{%x}", fingerprint),
+		rpm:         rpm,
+		period:      time.Minute,
+		tpm:         60000,
+		outputLimit: 1024,
 	}, nil
 }
 
 func (l *RateLimiter) Limit() int { return l.rpm }
 
 func (l *RateLimiter) Allow(ctx context.Context) (rateDecision, error) {
-	ctx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
-	defer cancel()
-	result, err := requestBucketScript.Run(ctx, l.client, []string{l.key}, l.rpm, l.period.Milliseconds()).Int64Slice()
-	if err != nil {
-		return rateDecision{}, err
-	}
-	if len(result) != 3 {
-		return rateDecision{}, fmt.Errorf("unexpected Redis rate-limit result")
-	}
-	return rateDecision{result[0] == 1, result[1], time.Duration(result[2]) * time.Millisecond}, nil
+	return l.Reserve(ctx, 0)
 }
 
 func limitRequests(limiter requestLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		decision, err := limiter.Allow(r.Context())
+		input, ok := decodeChatRequest(w, r, limiter.OutputLimit())
+		if !ok {
+			return
+		}
+		reserved := estimateInputTokens(input) + int64(*input.MaxCompletionTokens)
+		if reserved > int64(limiter.TokenLimit()) {
+			writeRequestError(w, 400, "Prompt estimate plus output allowance exceeds TPM_LIMIT; reduce the request.")
+			return
+		}
+		decision, err := limiter.Reserve(r.Context(), reserved)
 		if err != nil {
 			writeGatewayError(w, http.StatusServiceUnavailable, "Rate limiter is unavailable.")
 			return
 		}
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limiter.Limit()))
 		w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(decision.remaining, 10))
+		w.Header().Set("X-TokenLimit-Limit", strconv.Itoa(limiter.TokenLimit()))
+		w.Header().Set("X-TokenLimit-Remaining", strconv.FormatInt(decision.tokenRemaining, 10))
+		w.Header().Set("X-TokenLimit-Reserved", strconv.FormatInt(reserved, 10))
 		if !decision.allowed {
 			seconds := (decision.retryAfter + time.Second - 1) / time.Second
 			if seconds < 1 {
 				seconds = 1
 			}
 			w.Header().Set("Retry-After", strconv.FormatInt(int64(seconds), 10))
+			message := "Janus request rate limit exceeded."
+			if decision.tokenDenied {
+				message = "Janus token quota exceeded."
+			}
 			writeJSON(w, http.StatusTooManyRequests, map[string]any{
-				"error": map[string]string{"message": "Janus request rate limit exceeded.", "type": "rate_limit_error"},
+				"error": map[string]string{"message": message, "type": "rate_limit_error"},
 			})
 			return
 		}
-		next.ServeHTTP(w, r)
+		state := &requestAccounting{input: input}
+		defer func() {
+			actual := state.actual
+			if !state.attempted {
+				zero := int64(0)
+				actual = &zero
+			}
+			if actual == nil {
+				log.Println("Provider usage unavailable; retaining token reservation")
+				return
+			}
+			if err := limiter.Settle(context.Background(), decision.reservation, *actual); err != nil {
+				log.Println("Token reconciliation failed; reservation remains conservative")
+			}
+		}()
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), accountingKey{}, state)))
 	})
 }
