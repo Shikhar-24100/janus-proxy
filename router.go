@@ -74,6 +74,9 @@ func (p *Provider) routeChat(w http.ResponseWriter, r *http.Request, input ChatR
 		return
 	}
 	if failure.retryable && p.fallback != nil {
+		if state := accountingFrom(r); state != nil {
+			state.cacheCandidate = nil
+		}
 		// If primary never contacted upstream (e.g. open circuit), reuse the
 		// original allocation. Otherwise account for both provider attempts.
 		if state := accountingFrom(r); state != nil && state.attempted {

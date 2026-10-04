@@ -34,7 +34,7 @@ if amount > tpm then return {0, math.floor(tokens), tpm-total, 0, 2} end
 local retry = 0
 local reason = 0
 if spendRPM and tokens < 1 then retry = math.ceil((1-tokens)*window/rpm); reason = 1 end
-if total+amount > tpm then
+if amount > 0 and total+amount > tpm then
     local freed = 0
     local events = redis.call('ZRANGE', KEYS[2], 0, -1, 'WITHSCORES')
     for i=1,#events,2 do
@@ -56,7 +56,7 @@ if amount > 0 then
 end
 redis.call('SET', KEYS[4], total, 'PX', window*2)
 for i=1,3 do redis.call('PEXPIRE', KEYS[i], window*2) end
-return {1, math.floor(tokens), tpm-total, 0, 0}
+return {1, math.floor(tokens), math.max(0,tpm-total), 0, 0}
 `)
 
 // Settlement changes the charge at its ORIGINAL admission time, once only.

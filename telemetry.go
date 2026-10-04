@@ -24,14 +24,16 @@ type attemptObservation struct {
 }
 
 type requestTrace struct {
-	started        time.Time
-	route          string
-	stream         bool
-	streamStarted  bool
-	streamComplete bool
-	fallback       bool
-	ttft           *float64
-	attempts       []attemptObservation
+	started         time.Time
+	route           string
+	stream          bool
+	streamStarted   bool
+	streamComplete  bool
+	fallback        bool
+	ttft            *float64
+	attempts        []attemptObservation
+	cache           string
+	cacheWriteError bool
 }
 
 func traceFrom(r *http.Request) *requestTrace {
@@ -40,16 +42,18 @@ func traceFrom(r *http.Request) *requestTrace {
 }
 
 type requestEvent struct {
-	Time      time.Time            `json:"time"`
-	Event     string               `json:"event"`
-	RequestID string               `json:"request_id"`
-	Route     string               `json:"route"`
-	Status    int                  `json:"status"`
-	Outcome   string               `json:"outcome"`
-	Stream    bool                 `json:"stream"`
-	Duration  float64              `json:"duration_ms"`
-	TTFT      *float64             `json:"ttft_ms"`
-	Attempts  []attemptObservation `json:"attempts"`
+	Time            time.Time            `json:"time"`
+	Event           string               `json:"event"`
+	RequestID       string               `json:"request_id"`
+	Route           string               `json:"route"`
+	Status          int                  `json:"status"`
+	Outcome         string               `json:"outcome"`
+	Stream          bool                 `json:"stream"`
+	Duration        float64              `json:"duration_ms"`
+	TTFT            *float64             `json:"ttft_ms"`
+	Attempts        []attemptObservation `json:"attempts"`
+	Cache           string               `json:"cache"`
+	CacheWriteError bool                 `json:"cache_write_error"`
 }
 
 var latencyBounds = [...]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
@@ -75,23 +79,25 @@ type attemptMetric struct{ route, outcome string }
 
 // One registry per gateway. Labels come only from fixed internal categories.
 type telemetry struct {
-	mu        sync.Mutex
-	requests  map[requestMetric]uint64
-	attempts  map[attemptMetric]uint64
-	tokens    [2][3]uint64
-	unknown   [2]uint64
-	fallbacks uint64
-	inflight  int64
-	duration  latencyHistogram
-	ttft      latencyHistogram
-	queue     chan requestEvent
-	done      chan struct{}
-	closeOnce sync.Once
-	dropped   atomic.Uint64
-	logErrors atomic.Uint64
-	sequence  atomic.Uint64
-	idPrefix  string
-	breakers  map[string]*circuitBreaker
+	mu           sync.Mutex
+	requests     map[requestMetric]uint64
+	attempts     map[attemptMetric]uint64
+	tokens       [2][3]uint64
+	unknown      [2]uint64
+	fallbacks    uint64
+	cacheResults [4]uint64
+	cacheErrors  [2]uint64
+	inflight     int64
+	duration     latencyHistogram
+	ttft         latencyHistogram
+	queue        chan requestEvent
+	done         chan struct{}
+	closeOnce    sync.Once
+	dropped      atomic.Uint64
+	logErrors    atomic.Uint64
+	sequence     atomic.Uint64
+	idPrefix     string
+	breakers     map[string]*circuitBreaker
 }
 
 func newTelemetry(writer io.Writer) *telemetry {
@@ -158,7 +164,7 @@ func (w *flushingObservedWriter) Flush() {
 
 func (t *telemetry) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		trace := &requestTrace{started: time.Now(), route: "none", attempts: make([]attemptObservation, 0, 2)}
+		trace := &requestTrace{started: time.Now(), route: "none", cache: "BYPASS", attempts: make([]attemptObservation, 0, 2)}
 		id := t.idPrefix + "-" + strconv.FormatUint(t.sequence.Add(1), 16)
 		w.Header().Set("X-Request-ID", id)
 		captured := &observedWriter{ResponseWriter: w}
@@ -192,7 +198,7 @@ func (t *telemetry) observe(next http.Handler) http.Handler {
 			case status >= 400:
 				outcome = "error"
 			}
-			event := requestEvent{Time: time.Now().UTC(), Event: "chat_request", RequestID: id, Route: trace.route, Status: status, Outcome: outcome, Stream: trace.stream, Duration: float64(time.Since(trace.started)) / float64(time.Millisecond), TTFT: trace.ttft, Attempts: trace.attempts}
+			event := requestEvent{Time: time.Now().UTC(), Event: "chat_request", RequestID: id, Route: trace.route, Status: status, Outcome: outcome, Stream: trace.stream, Duration: float64(time.Since(trace.started)) / float64(time.Millisecond), TTFT: trace.ttft, Attempts: trace.attempts, Cache: trace.cache, CacheWriteError: trace.cacheWriteError}
 			t.record(event, trace.fallback)
 			if panicked != nil {
 				panic(panicked)
@@ -210,6 +216,20 @@ func (t *telemetry) record(event requestEvent, fallback bool) {
 	t.mu.Lock()
 	t.inflight--
 	t.requests[requestMetric{event.Route, status, event.Outcome}]++
+	cacheIndex := 2
+	switch event.Cache {
+	case "HIT":
+		cacheIndex = 0
+	case "MISS":
+		cacheIndex = 1
+	case "ERROR":
+		cacheIndex = 3
+		t.cacheErrors[0]++
+	}
+	t.cacheResults[cacheIndex]++
+	if event.CacheWriteError {
+		t.cacheErrors[1]++
+	}
 	t.duration.observe(event.Duration / 1000)
 	if event.TTFT != nil {
 		t.ttft.observe(*event.TTFT / 1000)
@@ -261,6 +281,14 @@ func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(&out, "# HELP janus_provider_attempts_total Provider route attempts, including skipped circuits.\n# TYPE janus_provider_attempts_total counter")
 	for key, count := range t.attempts {
 		fmt.Fprintf(&out, "janus_provider_attempts_total{route=%q,outcome=%q} %d\n", key.route, key.outcome, count)
+	}
+	fmt.Fprintln(&out, "# HELP janus_cache_requests_total Chat requests by cache decision.\n# TYPE janus_cache_requests_total counter")
+	for index, result := range []string{"hit", "miss", "bypass", "error"} {
+		fmt.Fprintf(&out, "janus_cache_requests_total{result=%q} %d\n", result, t.cacheResults[index])
+	}
+	fmt.Fprintln(&out, "# HELP janus_cache_errors_total Cache read or write failures.\n# TYPE janus_cache_errors_total counter")
+	for index, operation := range []string{"read", "write"} {
+		fmt.Fprintf(&out, "janus_cache_errors_total{operation=%q} %d\n", operation, t.cacheErrors[index])
 	}
 	fmt.Fprintln(&out, "# HELP janus_reported_tokens_total Valid provider-reported tokens; excludes unknown usage.\n# TYPE janus_reported_tokens_total counter")
 	// Keep each metric family contiguous for Prometheus text parsing.

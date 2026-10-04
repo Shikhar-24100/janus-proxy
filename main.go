@@ -50,6 +50,10 @@ func main() {
 	if err != nil {
 		log.Fatal("Cannot connect to Redis; check REDIS_URL and start Redis")
 	}
+	provider.cache, err = newResponseCache(limiter.client, os.Getenv("CACHE_TTL_SECONDS"), janusKey, provider)
+	if err != nil {
+		log.Fatal(err)
+	}
 	observability := newTelemetry(os.Stderr)
 	mux := newMuxWithTelemetry(provider, janusKey, limiter, observability)
 
@@ -73,7 +77,11 @@ func newMuxWithTelemetry(provider *Provider, janusKey string, limiter requestLim
 		}
 	}
 	mux.Handle("GET /metrics", requireAPIKey(janusKey, http.HandlerFunc(observability.serveMetrics)))
-	chat := limitRequests(limiter, http.HandlerFunc(provider.chatHandler))
+	var cache *responseCache
+	if provider != nil {
+		cache = provider.cache
+	}
+	chat := limitRequests(limiter, http.HandlerFunc(provider.chatHandler), cache)
 	mux.Handle("POST /v1/chat/completions", observability.observe(requireAPIKey(janusKey, chat)))
 	return mux
 }

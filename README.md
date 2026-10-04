@@ -249,9 +249,14 @@ interrupted streams and errors. Provider protocol:
 Client -> router -> authentication -> JSON decoding and validation
        -> Redis atomic RPM check + TPM reservation -> primary circuit breaker
        -> primary provider call -> qualifying failure before streaming?
-       -> optional fallback TPM allocation + breaker + provider call
+      -> optional fallback TPM allocation + breaker + provider call
        <- provider's JSON response and HTTP status <-
        -> reconcile TPM from actual provider usage in Redis
+
+Opted-in non-streaming: authenticate -> validate -> RPM -> Redis cache
+                       -> HIT: stored JSON, no TPM or provider
+                       -> MISS/error: TPM -> normal provider routing
+                       -> eligible primary response: store with TTL
 ```
 
 Supported input fields: `model`, `messages`, `stream` (defaults to false),
@@ -360,7 +365,21 @@ It never loads `.env` itself or prints credentials.
 See [fallback design and accounting examples](docs/fallback-routing.md).
 
 This is a local development gateway. Tenant management, accurate tokenization,
-caching, wider provider routing, and durable usage analytics are future steps.
+wider provider routing, and durable usage analytics are future steps.
+
+## Exact response caching
+
+Opt in with `X-Janus-Cache: true` on non-streaming requests. Janus stores complete
+successful primary text answers in the same Redis used for quotas, under separate
+SHA-256 keys. `CACHE_TTL_SECONDS` defaults to 300; zero disables caching.
+Streaming and fallback answers bypass storage. Cache hits spend one RPM permit,
+reserve zero TPM, and do not call the provider. Opted-in misses spend RPM before
+checking TPM; ordinary requests retain combined quota admission.
+
+Response headers show `X-Janus-Cache: HIT`, `MISS`, `BYPASS`, or `ERROR`.
+Hits use `X-Janus-Route: cache`. Original response usage is preserved but does not
+increase fresh provider usage metrics. Cache errors continue normal generation
+when quotas are available. See [cache design and PowerShell examples](docs/caching.md).
 
 ## Request logs and metrics
 

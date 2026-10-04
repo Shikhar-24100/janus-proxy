@@ -76,8 +76,13 @@ func (l *RateLimiter) Allow(ctx context.Context) (rateDecision, error) {
 	return l.Reserve(ctx, 0)
 }
 
-func limitRequests(limiter requestLimiter, next http.Handler) http.Handler {
+func limitRequests(limiter requestLimiter, next http.Handler, caches ...*responseCache) http.Handler {
+	var cache *responseCache
+	if len(caches) > 0 {
+		cache = caches[0]
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setCacheResult(w, r, "BYPASS")
 		input, ok := decodeChatRequest(w, r, limiter.OutputLimit())
 		if !ok {
 			return
@@ -86,11 +91,16 @@ func limitRequests(limiter requestLimiter, next http.Handler) http.Handler {
 			trace.stream = input.Stream
 		}
 		reserved := estimateInputTokens(input) + int64(*input.MaxCompletionTokens)
-		if reserved > int64(limiter.TokenLimit()) {
+		eligible := wantsCache(r, input, cache)
+		if !eligible && reserved > int64(limiter.TokenLimit()) {
 			writeRequestError(w, 400, "Prompt estimate plus output allowance exceeds TPM_LIMIT; reduce the request.")
 			return
 		}
-		decision, err := limiter.Reserve(r.Context(), reserved)
+		allocation := reserved
+		if eligible {
+			allocation = 0
+		}
+		decision, err := limiter.Reserve(r.Context(), allocation)
 		if err != nil {
 			writeGatewayError(w, http.StatusServiceUnavailable, "Rate limiter is unavailable.")
 			return
@@ -99,7 +109,7 @@ func limitRequests(limiter requestLimiter, next http.Handler) http.Handler {
 		w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(decision.remaining, 10))
 		w.Header().Set("X-TokenLimit-Limit", strconv.Itoa(limiter.TokenLimit()))
 		w.Header().Set("X-TokenLimit-Remaining", strconv.FormatInt(decision.tokenRemaining, 10))
-		w.Header().Set("X-TokenLimit-Reserved", strconv.FormatInt(reserved, 10))
+		w.Header().Set("X-TokenLimit-Reserved", strconv.FormatInt(allocation, 10))
 		if !decision.allowed {
 			seconds := (decision.retryAfter + time.Second - 1) / time.Second
 			if seconds < 1 {
@@ -115,7 +125,48 @@ func limitRequests(limiter requestLimiter, next http.Handler) http.Handler {
 			})
 			return
 		}
-		state := &requestAccounting{input: input, limiter: limiter, reservation: decision.reservation, reserved: reserved}
+		var candidate *cacheCandidate
+		if eligible {
+			key := cache.key(input)
+			data, cacheErr := cache.get(r.Context(), key)
+			if cacheErr == nil && data != nil {
+				setCacheResult(w, r, "HIT")
+				w.Header().Set("X-Janus-Route", "cache")
+				if trace := traceFrom(r); trace != nil {
+					trace.route = "cache"
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(data)
+				return
+			}
+			if cacheErr != nil {
+				setCacheResult(w, r, "ERROR")
+			} else {
+				setCacheResult(w, r, "MISS")
+			}
+			if reserved > int64(limiter.TokenLimit()) {
+				writeRequestError(w, 400, "Prompt estimate plus output allowance exceeds TPM_LIMIT; reduce the request.")
+				return
+			}
+			decision, err = limiter.ReserveTokens(r.Context(), reserved)
+			if err != nil {
+				writeGatewayError(w, 503, "Token limiter is unavailable.")
+				return
+			}
+			w.Header().Set("X-TokenLimit-Remaining", strconv.FormatInt(decision.tokenRemaining, 10))
+			w.Header().Set("X-TokenLimit-Reserved", strconv.FormatInt(reserved, 10))
+			if !decision.allowed {
+				seconds := (decision.retryAfter + time.Second - 1) / time.Second
+				if seconds < 1 {
+					seconds = 1
+				}
+				w.Header().Set("Retry-After", strconv.FormatInt(int64(seconds), 10))
+				writeJSON(w, 429, map[string]any{"error": map[string]string{"message": "Janus token quota exceeded.", "type": "rate_limit_error"}})
+				return
+			}
+			candidate = &cacheCandidate{cache: cache, key: key}
+		}
+		state := &requestAccounting{input: input, limiter: limiter, reservation: decision.reservation, reserved: reserved, cacheCandidate: candidate}
 		defer state.settle()
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), accountingKey{}, state)))
 	})

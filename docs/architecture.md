@@ -16,10 +16,14 @@ Decode and validate JSON; choose output allowance
 Estimate input + output allowance
   | individual reservation larger than TPM capacity -> 400
   v
-Atomic quota admission <----> Redis
+Quota admission <----> Redis
   | RPM: refillable request bucket
   | TPM: rolling 60-second ledger of token charges
   | exhausted -> 429 + Retry-After; unavailable -> 503
+  | opted-in non-streaming: spend RPM, then exact cache lookup
+  | cache hit -> stored JSON to client; zero TPM and no provider call
+  | cache miss/error -> reserve TPM; denial still spends RPM
+  | ordinary/streaming requests -> combined atomic RPM + TPM admission
   v
 Primary circuit breaker (inside Janus memory)
   | open / another probe running -> try configured fallback
@@ -37,6 +41,7 @@ Fallback breaker + HTTP client (separate key) -> configured fallback model
   +-> SSE -> read / observe usage / write / flush -> client stream
   |
   v
+Eligible opted-in primary JSON -> store response in Redis with TTL
 Handler completion -> settle actual usage in Redis
   | unknown usage -> keep reservation until original window expires
   v
@@ -50,8 +55,9 @@ streams are forwarded subject to client cancellation, provider failure, timeout,
 and the output allowance sent to the provider.
 
 Redis state is scoped to the shared Janus key's SHA-256 fingerprint. One Lua
-script checks both quotas atomically across gateway instances. Rejection spends
-neither quota. RPM holds 60 request permits by default and refills at one per
+script checks both quotas atomically across gateway instances for ordinary calls.
+Opted-in cache calls split RPM and TPM admission so hits need no TPM; a miss
+rejected by TPM still spends RPM. RPM holds 60 permits by default and refills at one per
 second. TPM defaults to 60000 tokens allocated in a rolling admission window.
 
 Each request has a unique ID. Actual usage replaces reserved usage once.
@@ -67,7 +73,7 @@ heuristic; accurate model tokenizers remain future work.
 
 ## Rough progress estimate
 
-About **50% of the first production-focused version** after adding operational
+About **55% of the first production-focused version** after adding exact caching,
 logs and metrics. This is an effort estimate, not a measured percentage or
 production-readiness claim. Optional semantic caching is outside this scope.
 
@@ -80,7 +86,7 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | RPM | Atomic Redis bucket |
 | TPM | Rolling reservations and actual usage settlement |
 | Tokenization | Byte heuristic; model tokenizer still needed |
-| Exact caching | Not built |
+| Exact caching | Opt-in non-streaming primary answers; Redis TTL and metrics |
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Individual keys, budgets, revocation still needed |
 | Durable usage pipeline | Event delivery and analytics storage still needed |
@@ -95,3 +101,4 @@ See [token accounting maths](token-accounting.md) for worked examples.
 See [circuit breaker design](circuit-breaker.md) for provider failure handling.
 See [fallback routing](fallback-routing.md) for multi-attempt accounting.
 See [observability](observability.md) for TTFT, logs, metrics, and limitations.
+See [caching](caching.md) for eligibility, quota behavior, and test commands.

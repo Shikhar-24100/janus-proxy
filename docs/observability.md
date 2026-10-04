@@ -28,6 +28,7 @@ GET /metrics + Janus key -> read metrics and breaker snapshots
 | TTFT histogram | Time until Janus flushes the first recognized non-empty text delta |
 | Circuit state gauge | Closed=0, open=1, half-open=2 for each configured route |
 | Logging counters | Events dropped due to a full queue, or failed log writes |
+| Cache counters | Hit/miss/bypass/error results and separate read/write errors |
 
 For total token usage, select `kind="total"`. That already includes prompt and
 completion tokens; summing all three kinds would double-count usage.
@@ -70,6 +71,11 @@ Every chat gets a server-generated `X-Request-ID`. The matching JSON console
 event contains status, outcome, selected route, stream flag, duration, optional
 TTFT, and at most two provider attempt records with upstream status, outcome,
 duration, and known token usage. Unknown usage is null, not zero.
+
+Logs also include `cache` (HIT/MISS/BYPASS/ERROR) and `cache_write_error`.
+A hit selects route `cache` and has no provider attempts. Although its JSON body
+contains the original generation's usage, it adds no fresh provider token usage.
+Duration includes cache operations; non-streaming hits have no TTFT sample.
 
 An HTTP 200 stream can still fail after headers were sent. The log and request
 metric therefore distinguish `success`, `error`, `interrupted`, and `canceled`.

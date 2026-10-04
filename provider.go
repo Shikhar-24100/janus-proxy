@@ -22,6 +22,7 @@ type Provider struct {
 	breaker       *circuitBreaker
 	fallback      *Provider
 	fallbackModel string
+	cache         *responseCache
 }
 
 func newProvider(baseURL, apiKey string) (*Provider, error) {
@@ -174,6 +175,13 @@ func (p *Provider) tryChat(w http.ResponseWriter, r *http.Request, input ChatReq
 	w.WriteHeader(response.StatusCode)
 	if _, err := w.Write(responseBody); err != nil {
 		log.Println("Could not write provider response to client")
+	} else if state := accountingFrom(r); state != nil && state.cacheCandidate != nil && response.StatusCode == 200 && cacheableAnswer(responseBody) {
+		candidate := state.cacheCandidate
+		if candidate.cache.put(r.Context(), candidate.key, responseBody) != nil {
+			if trace := traceFrom(r); trace != nil {
+				trace.cacheWriteError = true
+			}
+		}
 	}
 	return nil
 }

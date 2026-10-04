@@ -20,14 +20,15 @@ func estimateInputTokens(input ChatRequest) int64 {
 
 type accountingKey struct{}
 type requestAccounting struct {
-	input       ChatRequest
-	attempted   bool
-	actual      *int64
-	usage       *tokenUsage
-	limiter     requestLimiter
-	reservation string
-	reserved    int64
-	settled     bool
+	input          ChatRequest
+	attempted      bool
+	actual         *int64
+	usage          *tokenUsage
+	limiter        requestLimiter
+	reservation    string
+	reserved       int64
+	settled        bool
+	cacheCandidate *cacheCandidate
 }
 
 func (s *requestAccounting) settle() {
