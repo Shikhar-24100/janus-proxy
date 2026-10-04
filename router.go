@@ -66,6 +66,9 @@ func (f *attemptFailure) write(w http.ResponseWriter) {
 
 func (p *Provider) routeChat(w http.ResponseWriter, r *http.Request, input ChatRequest) {
 	w.Header().Set("X-Janus-Route", "primary")
+	if trace := traceFrom(r); trace != nil {
+		trace.route = "primary"
+	}
 	failure := p.tryChat(w, r, input)
 	if failure == nil || r.Context().Err() != nil {
 		return
@@ -91,9 +94,13 @@ func (p *Provider) routeChat(w http.ResponseWriter, r *http.Request, input ChatR
 			}
 			state.reservation = decision.reservation
 			state.attempted, state.settled, state.actual = false, false, nil
+			state.usage = nil
 		}
 		input.Model = p.fallbackModel
 		w.Header().Set("X-Janus-Route", "fallback")
+		if trace := traceFrom(r); trace != nil {
+			trace.route, trace.fallback = "fallback", true
+		}
 		failure = p.fallback.tryChat(w, r, input)
 		if failure == nil || r.Context().Err() != nil {
 			return

@@ -82,6 +82,9 @@ func limitRequests(limiter requestLimiter, next http.Handler) http.Handler {
 		if !ok {
 			return
 		}
+		if trace := traceFrom(r); trace != nil {
+			trace.stream = input.Stream
+		}
 		reserved := estimateInputTokens(input) + int64(*input.MaxCompletionTokens)
 		if reserved > int64(limiter.TokenLimit()) {
 			writeRequestError(w, 400, "Prompt estimate plus output allowance exceeds TPM_LIMIT; reduce the request.")

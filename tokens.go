@@ -23,6 +23,7 @@ type requestAccounting struct {
 	input       ChatRequest
 	attempted   bool
 	actual      *int64
+	usage       *tokenUsage
 	limiter     requestLimiter
 	reservation string
 	reserved    int64
@@ -60,15 +61,34 @@ type tokenUsage struct {
 }
 
 func reportedTokens(data []byte) *int64 {
-	var envelope struct {
-		Usage *tokenUsage `json:"usage"`
-		Groq  struct {
-			Usage *tokenUsage `json:"usage"`
-		} `json:"x_groq"`
+	usage := reportedUsage(data)
+	if usage == nil {
+		return nil
 	}
+	return usage.Total
+}
+
+type providerEnvelope struct {
+	Usage *tokenUsage `json:"usage"`
+	Groq  struct {
+		Usage *tokenUsage `json:"usage"`
+	} `json:"x_groq"`
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+func reportedUsage(data []byte) *tokenUsage {
+	var envelope providerEnvelope
 	if json.Unmarshal(data, &envelope) != nil {
 		return nil
 	}
+	return validUsage(envelope)
+}
+
+func validUsage(envelope providerEnvelope) *tokenUsage {
 	usage := envelope.Usage
 	if usage == nil {
 		usage = envelope.Groq.Usage
@@ -82,7 +102,7 @@ func reportedTokens(data []byte) *int64 {
 	if *usage.Prompt > *usage.Total || *usage.Completion > *usage.Total || *usage.Prompt+*usage.Completion != *usage.Total {
 		return nil
 	}
-	return usage.Total
+	return usage
 }
 
 // Observe SSE alongside forwarding. Parsing never changes the bytes sent to
@@ -95,6 +115,8 @@ type usageObserver struct {
 	disabled bool
 	done     bool
 	actual   *int64
+	usage    *tokenUsage
+	hasText  bool
 }
 
 func (o *usageObserver) Feed(chunk []byte) {
@@ -116,6 +138,7 @@ func (o *usageObserver) Feed(chunk []byte) {
 		if o.size > 64*1024 {
 			o.disabled = true
 			o.actual = nil
+			o.usage = nil
 			o.line = nil
 			o.data = nil
 		}
@@ -129,8 +152,16 @@ func (o *usageObserver) endLine() {
 			o.done = true
 		}
 		if !o.done {
-			if usage := reportedTokens([]byte(data)); usage != nil {
-				o.actual = usage
+			var envelope providerEnvelope
+			if json.Unmarshal([]byte(data), &envelope) == nil {
+				if usage := validUsage(envelope); usage != nil {
+					o.usage, o.actual = usage, usage.Total
+				}
+				for _, choice := range envelope.Choices {
+					if choice.Delta.Content != "" {
+						o.hasText = true
+					}
+				}
 			}
 		}
 		o.data = nil

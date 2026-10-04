@@ -7,7 +7,7 @@ it is not embedded inside Go. Groq is the remote LLM provider.
 Client (PowerShell, curl, browser app)
   | POST /v1/chat/completions + Janus API key
   v
-Router -> authentication
+Router -> telemetry wrapper (request ID, timer) -> authentication
   | missing/wrong key -> 401; public /health bypasses quotas
   v
 Decode and validate JSON; choose output allowance
@@ -39,6 +39,10 @@ Fallback breaker + HTTP client (separate key) -> configured fallback model
   v
 Handler completion -> settle actual usage in Redis
   | unknown usage -> keep reservation until original window expires
+  v
+Update metrics -> enqueue JSON request log -> background console writer
+
+GET /metrics + Janus key -> in-memory counters/histograms + circuit snapshots
 ```
 
 RPM and TPM govern admission, not response event speed or event count. Admitted
@@ -63,8 +67,8 @@ heuristic; accurate model tokenizers remain future work.
 
 ## Rough progress estimate
 
-About **45% of the first production-focused version** after adding two-provider
-fallback. This is an effort estimate, not a measured percentage or
+About **50% of the first production-focused version** after adding operational
+logs and metrics. This is an effort estimate, not a measured percentage or
 production-readiness claim. Optional semantic caching is outside this scope.
 
 | Area | Status |
@@ -80,7 +84,7 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Individual keys, budgets, revocation still needed |
 | Durable usage pipeline | Event delivery and analytics storage still needed |
-| Operations | Metrics, load tests, measured latency, hardening still needed |
+| Operations | Request logs and metrics built; load tests, measured overhead, hardening remain |
 
 Tests cover concurrency, refunds, duplicate/late settlement, underestimated
 usage, missing usage, fragmented SSE, and output bounds. Settlement is currently
@@ -90,3 +94,4 @@ persistence, replication, and durable billing remain future work.
 See [token accounting maths](token-accounting.md) for worked examples.
 See [circuit breaker design](circuit-breaker.md) for provider failure handling.
 See [fallback routing](fallback-routing.md) for multi-attempt accounting.
+See [observability](observability.md) for TTFT, logs, metrics, and limitations.

@@ -362,6 +362,33 @@ See [fallback design and accounting examples](docs/fallback-routing.md).
 This is a local development gateway. Tenant management, accurate tokenization,
 caching, wider provider routing, and durable usage analytics are future steps.
 
+## Request logs and metrics
+
+Janus emits one JSON console event per completed chat, with a server-generated
+`X-Request-ID`, selected route, HTTP status, outcome, duration, streaming TTFT,
+and per-attempt token usage. Prompts, answers, credentials, and model strings
+are excluded. Startup and diagnostic messages remain plain text.
+
+Fetch metrics using the Janus key:
+
+```powershell
+$janusKey = (Get-Content .env | Where-Object { $_ -like 'JANUS_API_KEY=*' }).Split('=', 2)[1]
+(Invoke-WebRequest -Uri http://localhost:8080/metrics `
+  -Headers @{ Authorization = "Bearer $janusKey" }).Content
+```
+
+`/metrics` is authenticated and bypasses chat quotas. It exposes request and
+attempt counters, known/unknown token usage, fallback selections, in-flight
+requests, latency histograms, logging loss, and circuit state. Metrics live in
+memory and reset on restart. No Prometheus server or Grafana dashboard is installed.
+
+Streaming TTFT measures the first flushed text delta, not header arrival. A 200
+stream without completion is recorded as interrupted. Logs go through a bounded
+256-event background queue; a full queue drops logs and increments a counter
+instead of delaying chat. This is not durable billing. Total latency includes
+provider generation and quota settlement, rather than isolated proxy overhead.
+See [observability notes and examples](docs/observability.md).
+
 ## Check
 
 ```powershell

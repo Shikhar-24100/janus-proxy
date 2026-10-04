@@ -5,6 +5,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"time"
 )
 
 func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, response *http.Response, outcome *breakerOutcome) {
@@ -24,6 +25,9 @@ func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, respons
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	if trace := traceFrom(r); trace != nil {
+		trace.streamStarted = true
+	}
 	flusher.Flush()
 
 	// A network read can contain part of an SSE event or several events.
@@ -38,15 +42,23 @@ func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, respons
 				abortStream(r, "Could not write stream to client")
 			}
 			flusher.Flush()
+			if trace := traceFrom(r); trace != nil && trace.ttft == nil && observer.hasText {
+				elapsed := float64(time.Since(trace.started)) / float64(time.Millisecond)
+				trace.ttft = &elapsed
+			}
 		}
 		if readErr == io.EOF {
 			if observer.done && !observer.disabled {
 				*outcome = breakerSuccess
+				if trace := traceFrom(r); trace != nil {
+					trace.streamComplete = true
+				}
 			} else {
 				*outcome = breakerFailure
 			}
 			if state := accountingFrom(r); state != nil && observer.done && !observer.disabled {
 				state.actual = observer.actual
+				state.usage = observer.usage
 			}
 			return
 		}

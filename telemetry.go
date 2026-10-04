@@ -1,0 +1,290 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type traceKey struct{}
+
+type attemptObservation struct {
+	Route    string      `json:"route"`
+	Outcome  string      `json:"outcome"`
+	Status   int         `json:"upstream_status"`
+	Duration float64     `json:"duration_ms"`
+	Usage    *tokenUsage `json:"usage"`
+}
+
+type requestTrace struct {
+	started        time.Time
+	route          string
+	stream         bool
+	streamStarted  bool
+	streamComplete bool
+	fallback       bool
+	ttft           *float64
+	attempts       []attemptObservation
+}
+
+func traceFrom(r *http.Request) *requestTrace {
+	trace, _ := r.Context().Value(traceKey{}).(*requestTrace)
+	return trace
+}
+
+type requestEvent struct {
+	Time      time.Time            `json:"time"`
+	Event     string               `json:"event"`
+	RequestID string               `json:"request_id"`
+	Route     string               `json:"route"`
+	Status    int                  `json:"status"`
+	Outcome   string               `json:"outcome"`
+	Stream    bool                 `json:"stream"`
+	Duration  float64              `json:"duration_ms"`
+	TTFT      *float64             `json:"ttft_ms"`
+	Attempts  []attemptObservation `json:"attempts"`
+}
+
+var latencyBounds = [...]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
+
+type latencyHistogram struct {
+	buckets [len(latencyBounds)]uint64
+	count   uint64
+	sum     float64
+}
+
+func (h *latencyHistogram) observe(seconds float64) {
+	h.count++
+	h.sum += seconds
+	for i, bound := range latencyBounds {
+		if seconds <= bound {
+			h.buckets[i]++
+		}
+	}
+}
+
+type requestMetric struct{ route, status, outcome string }
+type attemptMetric struct{ route, outcome string }
+
+// One registry per gateway. Labels come only from fixed internal categories.
+type telemetry struct {
+	mu        sync.Mutex
+	requests  map[requestMetric]uint64
+	attempts  map[attemptMetric]uint64
+	tokens    [2][3]uint64
+	unknown   [2]uint64
+	fallbacks uint64
+	inflight  int64
+	duration  latencyHistogram
+	ttft      latencyHistogram
+	queue     chan requestEvent
+	done      chan struct{}
+	closeOnce sync.Once
+	dropped   atomic.Uint64
+	logErrors atomic.Uint64
+	sequence  atomic.Uint64
+	idPrefix  string
+	breakers  map[string]*circuitBreaker
+}
+
+func newTelemetry(writer io.Writer) *telemetry {
+	t := &telemetry{requests: make(map[requestMetric]uint64), attempts: make(map[attemptMetric]uint64), idPrefix: strconv.FormatInt(time.Now().UnixNano(), 16), breakers: make(map[string]*circuitBreaker)}
+	if writer != nil {
+		t.queue, t.done = make(chan requestEvent, 256), make(chan struct{})
+		go func() {
+			defer close(t.done)
+			encoder := json.NewEncoder(writer)
+			for event := range t.queue {
+				if encoder.Encode(event) != nil {
+					t.logErrors.Add(1)
+				}
+			}
+		}()
+	}
+	return t
+}
+
+// Drain only after all handlers have stopped; production shutdown is a later step.
+func (t *telemetry) close() {
+	t.closeOnce.Do(func() {
+		if t.queue != nil {
+			close(t.queue)
+			<-t.done
+		}
+	})
+}
+
+type observedWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *observedWriter) WriteHeader(status int) {
+	if status >= 100 && status < 200 {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *observedWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(200)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *observedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+type flushingObservedWriter struct{ *observedWriter }
+
+func (w *flushingObservedWriter) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(200)
+	}
+	w.ResponseWriter.(http.Flusher).Flush()
+}
+
+func (t *telemetry) observe(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trace := &requestTrace{started: time.Now(), route: "none", attempts: make([]attemptObservation, 0, 2)}
+		id := t.idPrefix + "-" + strconv.FormatUint(t.sequence.Add(1), 16)
+		w.Header().Set("X-Request-ID", id)
+		captured := &observedWriter{ResponseWriter: w}
+		var wrapped http.ResponseWriter = captured
+		if _, ok := w.(http.Flusher); ok {
+			wrapped = &flushingObservedWriter{captured}
+		}
+		t.mu.Lock()
+		t.inflight++
+		t.mu.Unlock()
+		defer func() {
+			panicked := recover()
+			status := captured.status
+			if status == 0 {
+				status = 200
+				if r.Context().Err() != nil {
+					status = 0
+				}
+			}
+			outcome := "success"
+			switch {
+			case r.Context().Err() != nil:
+				outcome = "canceled"
+			case panicked != nil:
+				outcome = "interrupted"
+				if captured.status == 0 {
+					status = 500
+				}
+			case trace.streamStarted && !trace.streamComplete:
+				outcome = "interrupted"
+			case status >= 400:
+				outcome = "error"
+			}
+			event := requestEvent{Time: time.Now().UTC(), Event: "chat_request", RequestID: id, Route: trace.route, Status: status, Outcome: outcome, Stream: trace.stream, Duration: float64(time.Since(trace.started)) / float64(time.Millisecond), TTFT: trace.ttft, Attempts: trace.attempts}
+			t.record(event, trace.fallback)
+			if panicked != nil {
+				panic(panicked)
+			}
+		}()
+		next.ServeHTTP(wrapped, r.WithContext(context.WithValue(r.Context(), traceKey{}, trace)))
+	})
+}
+
+func (t *telemetry) record(event requestEvent, fallback bool) {
+	status := "other"
+	if event.Status >= 100 && event.Status < 600 {
+		status = strconv.Itoa(event.Status/100) + "xx"
+	}
+	t.mu.Lock()
+	t.inflight--
+	t.requests[requestMetric{event.Route, status, event.Outcome}]++
+	t.duration.observe(event.Duration / 1000)
+	if event.TTFT != nil {
+		t.ttft.observe(*event.TTFT / 1000)
+	}
+	if fallback {
+		t.fallbacks++
+	}
+	for _, attempt := range event.Attempts {
+		t.attempts[attemptMetric{attempt.Route, attempt.Outcome}]++
+		index := 0
+		if attempt.Route == "fallback" {
+			index = 1
+		}
+		if attempt.Outcome != "skipped" {
+			if attempt.Usage == nil {
+				t.unknown[index]++
+			} else {
+				t.tokens[index][0] += uint64(*attempt.Usage.Prompt)
+				t.tokens[index][1] += uint64(*attempt.Usage.Completion)
+				t.tokens[index][2] += uint64(*attempt.Usage.Total)
+			}
+		}
+	}
+	t.mu.Unlock()
+	if t.queue != nil {
+		select {
+		case t.queue <- event:
+		default:
+			t.dropped.Add(1)
+		}
+	}
+}
+
+func writeHistogram(out *strings.Builder, name, help string, h latencyHistogram) {
+	fmt.Fprintf(out, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
+	for i, bound := range latencyBounds {
+		fmt.Fprintf(out, "%s_bucket{le=%q} %d\n", name, strconv.FormatFloat(bound, 'g', -1, 64), h.buckets[i])
+	}
+	fmt.Fprintf(out, "%s_bucket{le=\"+Inf\"} %d\n%s_sum %g\n%s_count %d\n", name, h.count, name, h.sum, name, h.count)
+}
+
+func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	var out strings.Builder
+	t.mu.Lock()
+	fmt.Fprintln(&out, "# HELP janus_chat_requests_total Finished chat requests, including rejected calls.\n# TYPE janus_chat_requests_total counter")
+	for key, count := range t.requests {
+		fmt.Fprintf(&out, "janus_chat_requests_total{route=%q,status_class=%q,outcome=%q} %d\n", key.route, key.status, key.outcome, count)
+	}
+	fmt.Fprintln(&out, "# HELP janus_provider_attempts_total Provider route attempts, including skipped circuits.\n# TYPE janus_provider_attempts_total counter")
+	for key, count := range t.attempts {
+		fmt.Fprintf(&out, "janus_provider_attempts_total{route=%q,outcome=%q} %d\n", key.route, key.outcome, count)
+	}
+	fmt.Fprintln(&out, "# HELP janus_reported_tokens_total Valid provider-reported tokens; excludes unknown usage.\n# TYPE janus_reported_tokens_total counter")
+	// Keep each metric family contiguous for Prometheus text parsing.
+	for index, route := range []string{"primary", "fallback"} {
+		for kind, name := range []string{"prompt", "completion", "total"} {
+			fmt.Fprintf(&out, "janus_reported_tokens_total{route=%q,kind=%q} %d\n", route, name, t.tokens[index][kind])
+		}
+	}
+	fmt.Fprintln(&out, "# HELP janus_usage_unknown_total Contacted provider attempts without valid final usage.\n# TYPE janus_usage_unknown_total counter")
+	for index, route := range []string{"primary", "fallback"} {
+		fmt.Fprintf(&out, "janus_usage_unknown_total{route=%q} %d\n", route, t.unknown[index])
+	}
+	fmt.Fprintf(&out, "# HELP janus_fallback_selections_total Requests selecting the fallback route.\n# TYPE janus_fallback_selections_total counter\njanus_fallback_selections_total %d\n# HELP janus_chat_inflight Current chat handlers.\n# TYPE janus_chat_inflight gauge\njanus_chat_inflight %d\n", t.fallbacks, t.inflight)
+	writeHistogram(&out, "janus_request_duration_seconds", "Handler duration including quota settlement and client writes.", t.duration)
+	writeHistogram(&out, "janus_ttft_seconds", "Time from handler entry to flushing the first recognized text delta.", t.ttft)
+	t.mu.Unlock()
+	fmt.Fprintf(&out, "# HELP janus_log_dropped_total Request logs dropped when the queue is full.\n# TYPE janus_log_dropped_total counter\njanus_log_dropped_total %d\n# HELP janus_log_write_errors_total Failed JSON log writes.\n# TYPE janus_log_write_errors_total counter\njanus_log_write_errors_total %d\n", t.dropped.Load(), t.logErrors.Load())
+	fmt.Fprintln(&out, "# HELP janus_circuit_state Provider circuit state: closed=0, open=1, half-open=2.\n# TYPE janus_circuit_state gauge")
+	for route, breaker := range t.breakers {
+		breaker.mu.Lock()
+		state := breaker.state
+		breaker.mu.Unlock()
+		fmt.Fprintf(&out, "janus_circuit_state{route=%q} %d\n", route, state)
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Write([]byte(out.String()))
+}

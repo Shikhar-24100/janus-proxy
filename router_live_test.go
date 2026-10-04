@@ -28,7 +28,8 @@ func TestLiveConfiguredFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	limiter := testQuota(t, "60", 60000)
-	gateway := httptest.NewServer(newMux(p, "live-test-client", limiter))
+	observability := newTelemetry(nil)
+	gateway := httptest.NewServer(newMuxWithTelemetry(p, "live-test-client", limiter, observability))
 	defer gateway.Close()
 	for _, stream := range []bool{false, true} {
 		streamValue := "false"
@@ -63,5 +64,10 @@ func TestLiveConfiguredFallback(t *testing.T) {
 			t.Fatal("live fallback missing usage or visible answer")
 		}
 		t.Logf("Configured fallback stream=%v actual total tokens=%d", stream, *usage)
+	}
+	observability.mu.Lock()
+	defer observability.mu.Unlock()
+	if observability.fallbacks != 2 || observability.tokens[1][2] == 0 || observability.ttft.count != 1 {
+		t.Fatal("live fallback telemetry was not recorded")
 	}
 }

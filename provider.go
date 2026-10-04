@@ -58,6 +58,31 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 // No response is committed on an attempt failure; the router can decide to
 // try another provider. Once streaming starts, this function never offers retry.
 func (p *Provider) tryChat(w http.ResponseWriter, r *http.Request, input ChatRequest) *attemptFailure {
+	started := time.Now()
+	outcome := breakerNeutral
+	attempted, providerStatus := false, 0
+	defer func() {
+		if trace := traceFrom(r); trace != nil {
+			result := "neutral"
+			switch {
+			case !attempted:
+				result = "skipped"
+			case r.Context().Err() != nil:
+				result = "canceled"
+			case outcome == breakerFailure:
+				result = "failure"
+			case providerStatus >= 400:
+				result = "client_error"
+			case outcome == breakerSuccess:
+				result = "success"
+			}
+			var usage *tokenUsage
+			if state := accountingFrom(r); state != nil && attempted {
+				usage = state.usage
+			}
+			trace.attempts = append(trace.attempts, attemptObservation{Route: trace.route, Outcome: result, Status: providerStatus, Duration: float64(time.Since(started)) / float64(time.Millisecond), Usage: usage})
+		}
+	}()
 	if p.apiKey == "" {
 		return gatewayFailure(503, "Provider API key is not configured.", true)
 	}
@@ -81,7 +106,6 @@ func (p *Provider) tryChat(w http.ResponseWriter, r *http.Request, input ChatReq
 		failure.retryAfter = strconv.FormatInt(int64(seconds), 10)
 		return failure
 	}
-	outcome := breakerNeutral
 	defer func() {
 		if r.Context().Err() != nil {
 			outcome = breakerNeutral
@@ -92,12 +116,14 @@ func (p *Provider) tryChat(w http.ResponseWriter, r *http.Request, input ChatReq
 	if state := accountingFrom(r); state != nil {
 		state.attempted = true
 	}
+	attempted = true
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		outcome = breakerFailure
 		return upstreamFailure(r, err)
 	}
 	defer response.Body.Close()
+	providerStatus = response.StatusCode
 	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500 {
 		outcome = breakerFailure
 	}
@@ -133,7 +159,10 @@ func (p *Provider) tryChat(w http.ResponseWriter, r *http.Request, input ChatReq
 
 	// Keep the provider's JSON and status, including errors such as 429.
 	if state := accountingFrom(r); state != nil {
-		state.actual = reportedTokens(responseBody)
+		state.usage = reportedUsage(responseBody)
+		if state.usage != nil {
+			state.actual = state.usage.Total
+		}
 	}
 	if response.StatusCode >= 400 {
 		return &attemptFailure{status: response.StatusCode, body: responseBody, retryAfter: response.Header.Get("Retry-After"), retryable: response.StatusCode == 429 || response.StatusCode >= 500}

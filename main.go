@@ -50,7 +50,8 @@ func main() {
 	if err != nil {
 		log.Fatal("Cannot connect to Redis; check REDIS_URL and start Redis")
 	}
-	mux := newMux(provider, janusKey, limiter)
+	observability := newTelemetry(os.Stderr)
+	mux := newMuxWithTelemetry(provider, janusKey, limiter, observability)
 
 	log.Println("Janus proxy listening on http://localhost:8080")
 	if err := http.ListenAndServe("127.0.0.1:8080", mux); err != nil {
@@ -59,10 +60,21 @@ func main() {
 }
 
 func newMux(provider *Provider, janusKey string, limiter requestLimiter) *http.ServeMux {
+	return newMuxWithTelemetry(provider, janusKey, limiter, newTelemetry(nil))
+}
+
+func newMuxWithTelemetry(provider *Provider, janusKey string, limiter requestLimiter, observability *telemetry) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler)
+	if provider != nil {
+		observability.breakers["primary"] = provider.breaker
+		if provider.fallback != nil {
+			observability.breakers["fallback"] = provider.fallback.breaker
+		}
+	}
+	mux.Handle("GET /metrics", requireAPIKey(janusKey, http.HandlerFunc(observability.serveMetrics)))
 	chat := limitRequests(limiter, http.HandlerFunc(provider.chatHandler))
-	mux.Handle("POST /v1/chat/completions", requireAPIKey(janusKey, chat))
+	mux.Handle("POST /v1/chat/completions", observability.observe(requireAPIKey(janusKey, chat)))
 	return mux
 }
 
