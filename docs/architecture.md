@@ -31,7 +31,7 @@ Fallback router -> reserve more TPM if primary was attempted
   | skipped primary -> reuse original allocation
   | insufficient token quota -> 429; Redis unavailable -> 503
   v
-Fallback breaker + HTTP client (OpenAI key) -> configured fallback model
+Fallback breaker + HTTP client (separate key) -> configured fallback model
   |
   +-> complete JSON -> bounded read -> client response
   +-> SSE -> read / observe usage / write / flush -> client stream
@@ -70,7 +70,7 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | Area | Status |
 | --- | --- |
 | API and validation | Basic text-only subset |
-| Provider calls | Compatible primary + optional fallback; live Groq verified |
+| Provider calls | Primary + second Groq key fallback; live JSON/SSE verified |
 | SSE streaming | Forwarding, flushing, cancellation, failure tests |
 | Authentication | One shared key; no tenant registry |
 | RPM | Atomic Redis bucket |

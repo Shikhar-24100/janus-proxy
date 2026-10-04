@@ -9,11 +9,11 @@ import (
 	"testing"
 )
 
-// Explicit opt-in only: this test sends two small, billed OpenAI requests.
+// Explicit opt-in only: this test sends two small requests to the configured fallback.
 // The normal suite uses fake providers and never reads local credentials.
-func TestLiveOpenAIFallback(t *testing.T) {
+func TestLiveConfiguredFallback(t *testing.T) {
 	if os.Getenv("JANUS_LIVE_FALLBACK") != "1" {
-		t.Skip("opt in to two billed fallback requests")
+		t.Skip("opt in to two potentially billed fallback requests")
 	}
 	if strings.TrimSpace(os.Getenv("FALLBACK_API_KEY")) == "" {
 		t.Fatal("fallback key is required")
@@ -24,7 +24,7 @@ func TestLiveOpenAIFallback(t *testing.T) {
 	}))
 	defer primary.Close()
 	p, _ := newProvider(primary.URL, "fake-primary-key")
-	if err := p.configureFallback("https://api.openai.com/v1", os.Getenv("FALLBACK_API_KEY"), "gpt-4o-mini"); err != nil {
+	if err := p.configureFallback(os.Getenv("FALLBACK_BASE_URL"), os.Getenv("FALLBACK_API_KEY"), os.Getenv("FALLBACK_MODEL")); err != nil {
 		t.Fatal(err)
 	}
 	limiter := testQuota(t, "60", 60000)
@@ -35,7 +35,7 @@ func TestLiveOpenAIFallback(t *testing.T) {
 		if stream {
 			streamValue = "true"
 		}
-		body := `{"model":"fake-primary-model","messages":[{"role":"user","content":"Reply with exactly: fallback works."}],"max_completion_tokens":32,"stream":` + streamValue + `}`
+		body := `{"model":"fake-primary-model","messages":[{"role":"user","content":"Reply with exactly: fallback works."}],"max_completion_tokens":256,"stream":` + streamValue + `}`
 		r, _ := http.NewRequest("POST", gateway.URL+"/v1/chat/completions", strings.NewReader(body))
 		r.Header.Set("Authorization", "Bearer live-test-client")
 		r.Header.Set("Content-Type", "application/json")
@@ -62,6 +62,6 @@ func TestLiveOpenAIFallback(t *testing.T) {
 		if usage == nil || !strings.Contains(strings.ToLower(string(data)), "fallback") {
 			t.Fatal("live fallback missing usage or visible answer")
 		}
-		t.Logf("OpenAI fallback stream=%v actual total tokens=%d", stream, *usage)
+		t.Logf("Configured fallback stream=%v actual total tokens=%d", stream, *usage)
 	}
 }

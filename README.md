@@ -303,13 +303,21 @@ TPM because no upstream attempt happened; RPM remains spent. With fallback,
 the unused original TPM allocation is reused for that provider attempt.
 See [breaker examples and design](docs/circuit-breaker.md).
 
-## Groq to OpenAI fallback
+## Optional provider fallback
 
 The primary settings remain `OPENAI_BASE_URL` and `OPENAI_API_KEY`; in our local
 setup these point to Groq. A non-empty `FALLBACK_API_KEY` enables one secondary
 OpenAI-compatible endpoint. `FALLBACK_BASE_URL` defaults to
 `https://api.openai.com/v1`; `FALLBACK_MODEL` defaults to `gpt-4o-mini`.
 Leave the fallback key empty to disable it. `run.ps1` loads all three settings.
+
+Our current local fallback uses a second Groq key with
+`FALLBACK_BASE_URL=https://api.groq.com/openai/v1` and
+`FALLBACK_MODEL=openai/gpt-oss-20b`. JSON and SSE fallback were live-verified.
+This can help with credential-specific failures, but both routes depend on
+Groq availability. Keys in the same Groq account may share provider quotas.
+The OpenAI settings remain available as an alternative; its earlier key was
+rejected with HTTP 401.
 
 The primary receives the client's model unchanged. The fallback receives the
 same messages, stream settings, and output allowance with its configured model
@@ -344,10 +352,11 @@ Verify current prices in the
 [official model documentation](https://developers.openai.com/api/docs/models/gpt-4o-mini).
 Janus does not enforce dollar budgets; TPM is a token allocation limit.
 
-The ordinary test suite uses fake providers. `TestLiveOpenAIFallback` requires
+The ordinary test suite uses fake providers. `TestLiveConfiguredFallback` requires
 explicit `JANUS_LIVE_FALLBACK=1`, `FALLBACK_API_KEY`, and `REDIS_TEST_URL`.
-It simulates a primary failure and sends up to two billed OpenAI calls, each
-with a 32-token output cap. It never loads `.env` itself or prints credentials.
+It uses the configured fallback URL/model, simulates a primary failure, and
+sends up to two potentially billed calls, each with a 256-token output cap.
+It never loads `.env` itself or prints credentials.
 See [fallback design and accounting examples](docs/fallback-routing.md).
 
 This is a local development gateway. Tenant management, accurate tokenization,

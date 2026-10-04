@@ -1,4 +1,4 @@
-# Groq to OpenAI fallback
+# Primary to configured provider fallback
 
 ```text
 Client -> authenticate -> validate -> initial RPM + TPM allocation
@@ -8,7 +8,7 @@ Client -> authenticate -> validate -> initial RPM + TPM allocation
                    settle primary allocation if usage known
                    reserve fallback TPM (no second RPM)
                             v
-                   fallback breaker -> OpenAI -> client
+                   fallback breaker -> configured provider -> client
 ```
 
 If the primary was never contacted, reuse the initial token allocation instead
@@ -22,6 +22,12 @@ reservation: an error does not prove the provider did no work.
 The primary retains the client's model. The fallback substitutes its configured
 model but preserves messages, stream settings, and output cap. Do not commit
 real keys. These providers both support our current text-only chat subset.
+
+Current local fallback: a second Groq key, base URL
+`https://api.groq.com/openai/v1`, model `openai/gpt-oss-20b`. Live normal and
+streaming fallback checks passed. A second key does not provide independence
+from Groq outages, and account-level quotas may still be shared. The OpenAI
+configuration remains an alternative once a working key is available.
 
 `router.go` selects one of two routes and delays sending errors until the route
 decision is final. `provider.go` performs an attempt and reports errors without
@@ -63,8 +69,9 @@ conservative until their original rolling windows expire.
 
 Tests cover routing, credentials/model substitution, original error preservation,
 cancelation, stream boundaries, separate usage charges, open-circuit reuse, and
-fallback quota denial. The opt-in live test caps each of two calls at 32 output
-tokens. Ordinary tests never contact OpenAI.
+fallback quota denial. The opt-in live test uses configured URL/model settings
+and caps each of two calls at 256 output tokens. Ordinary tests never contact
+remote providers.
 
 Dollar budgets are separate from token quota; Janus currently does not enforce
 a dollar spend cap. Prices and model access should be checked against the
