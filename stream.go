@@ -7,9 +7,10 @@ import (
 	"net/http"
 )
 
-func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, response *http.Response) {
+func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, response *http.Response, outcome *breakerOutcome) {
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || mediaType != "text/event-stream" {
+		*outcome = breakerFailure
 		writeGatewayError(w, http.StatusBadGateway, "Provider did not return an SSE stream.")
 		return
 	}
@@ -39,12 +40,18 @@ func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, respons
 			flusher.Flush()
 		}
 		if readErr == io.EOF {
+			if observer.done && !observer.disabled {
+				*outcome = breakerSuccess
+			} else {
+				*outcome = breakerFailure
+			}
 			if state := accountingFrom(r); state != nil && observer.done && !observer.disabled {
 				state.actual = observer.actual
 			}
 			return
 		}
 		if readErr != nil {
+			*outcome = breakerFailure
 			abortStream(r, "Provider stream interrupted")
 		}
 	}

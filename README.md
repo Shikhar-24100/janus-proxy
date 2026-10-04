@@ -6,6 +6,9 @@ Currently supports a local health endpoint and streaming or non-streaming chat r
 one OpenAI-compatible upstream, client authentication, and Redis RPM/TPM quotas
 with provider usage reconciliation.
 
+Provider calls also use an in-memory circuit breaker to stop repeatedly calling
+an upstream that is failing.
+
 ## Run
 
 Requires Go 1.24 or newer and Redis. Our local Go installation already meets this.
@@ -243,7 +246,8 @@ interrupted streams and errors. Provider protocol:
 
 ```text
 Client -> router -> authentication -> JSON decoding and validation
-       -> Redis atomic RPM check + TPM reservation -> provider HTTP call
+       -> Redis atomic RPM check + TPM reservation -> circuit breaker
+       -> provider HTTP call
        <- provider's JSON response and HTTP status <-
        -> reconcile TPM from actual provider usage in Redis
 ```
@@ -261,6 +265,40 @@ Provider calls have a 60-second timeout and use the incoming request's context
 for cancellation. JSON provider errors keep their status (including 429) and
 `Retry-After`; network failures return 502 and timeouts return 504. Redirects
 are rejected. Non-streaming responses are buffered before sending to the client.
+
+## Provider circuit breaker
+
+Each configured Provider owns a breaker scoped to its endpoint and credential.
+Five consecutive qualifying failures open it for 30 seconds. An open circuit
+returns a Janus JSON 503 with `Retry-After`, without calling the provider.
+When cooldown expires, the next incoming request becomes the single half-open
+probe; other calls receive 503 with `Retry-After: 1` while it is running. No
+background health request is generated. Recovery is not guaranteed by that
+retry hint.
+
+Network errors, upstream timeouts, HTTP 429/5xx, invalid or oversized JSON,
+unexpected redirects, and invalid or incomplete SSE count as failures. Valid
+non-429 4xx responses demonstrate reachability and reset the failure streak;
+their original status/body are preserved. Client cancellations and stream writes
+that fail toward the client do not count as provider outages. Concurrent results
+count in completion order within the current breaker generation.
+
+A streaming probe stays in flight until the stream ends. Clean EOF with a
+recognized `[DONE]` means breaker success even if token usage is missing;
+TPM settlement separately requires valid usage. Upstream read errors still
+abort an active stream; the breaker only affects future requests. A canceled
+probe returns to open for another cooldown so the trial slot cannot get stuck.
+Results from calls admitted before a state transition cannot alter the new state.
+
+The breaker is guarded by a Go mutex and lives in each Janus process, not Redis.
+Restarting Janus resets it; separate instances have separate breakers. The mutex
+is held only for short state changes, never while waiting on HTTP. Calls already
+in flight can continue after the circuit opens. There are no retries or fallback
+providers in this step.
+
+Quota admission still runs first: a breaker-blocked call spends one RPM permit,
+then releases its TPM reservation because no upstream attempt happened.
+See [breaker examples and design](docs/circuit-breaker.md).
 
 This is a local development gateway. Tenant management, accurate tokenization,
 fallback, caching, and durable usage analytics are future steps.

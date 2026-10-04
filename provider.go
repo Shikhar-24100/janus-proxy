@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,6 +19,7 @@ type Provider struct {
 	endpoint string
 	apiKey   string
 	client   *http.Client
+	breaker  *circuitBreaker
 }
 
 func newProvider(baseURL, apiKey string) (*Provider, error) {
@@ -36,6 +38,7 @@ func newProvider(baseURL, apiKey string) (*Provider, error) {
 	return &Provider{
 		endpoint: u.String(),
 		apiKey:   strings.TrimSpace(apiKey),
+		breaker:  newCircuitBreaker(),
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			// Do not follow redirects with provider credentials.
@@ -66,21 +69,41 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Set("Authorization", "Bearer "+p.apiKey)
 
+	generation, allowed, retry := p.breaker.acquire()
+	if !allowed {
+		seconds := (retry + time.Second - 1) / time.Second
+		w.Header().Set("Retry-After", strconv.FormatInt(int64(seconds), 10))
+		writeGatewayError(w, http.StatusServiceUnavailable, "Provider circuit is open; try again later.")
+		return
+	}
+	outcome := breakerNeutral
+	defer func() {
+		if r.Context().Err() != nil {
+			outcome = breakerNeutral
+		}
+		p.breaker.finish(generation, outcome)
+	}()
+
 	if state := accountingFrom(r); state != nil {
 		state.attempted = true
 	}
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
+		outcome = breakerFailure
 		p.writeUpstreamError(w, r, err)
 		return
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500 {
+		outcome = breakerFailure
+	}
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
+		outcome = breakerFailure
 		writeGatewayError(w, http.StatusBadGateway, "Provider returned an unexpected redirect.")
 		return
 	}
 	if input.Stream && response.StatusCode == http.StatusOK {
-		p.forwardStream(w, r, response)
+		p.forwardStream(w, r, response, &outcome)
 		return
 	}
 
@@ -88,12 +111,18 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	const maxResponseBytes = 4 << 20
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
+		outcome = breakerFailure
 		p.writeUpstreamError(w, r, err)
 		return
 	}
 	if len(responseBody) > maxResponseBytes || !json.Valid(responseBody) {
+		outcome = breakerFailure
 		writeGatewayError(w, http.StatusBadGateway, "Provider returned an oversized or invalid JSON response.")
 		return
+	}
+	if outcome != breakerFailure {
+		// Non-429 client errors demonstrate reachability, not an outage.
+		outcome = breakerSuccess
 	}
 
 	// Keep the provider's JSON and status, including errors such as 429.

@@ -21,6 +21,9 @@ Atomic quota admission <----> Redis
   | TPM: rolling 60-second ledger of token charges
   | exhausted -> 429 + Retry-After; unavailable -> 503
   v
+Circuit breaker (inside Janus memory)
+  | open / another probe running -> 503; release reserved TPM
+  v
 Provider HTTP client (separate Groq key) -> Groq
   |
   +-> complete JSON -> bounded read -> client response
@@ -67,7 +70,7 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | TPM | Rolling reservations and actual usage settlement |
 | Tokenization | Byte heuristic; model tokenizer still needed |
 | Exact caching | Not built |
-| Routing and fallback | Not built |
+| Provider resilience | Circuit breaker built; routing and fallback still needed |
 | Tenant management | Individual keys, budgets, revocation still needed |
 | Durable usage pipeline | Event delivery and analytics storage still needed |
 | Operations | Metrics, load tests, measured latency, hardening still needed |
@@ -78,3 +81,4 @@ a bounded call at handler completion, not a durable worker. Crash recovery,
 persistence, replication, and durable billing remain future work.
 
 See [token accounting maths](token-accounting.md) for worked examples.
+See [circuit breaker design](circuit-breaker.md) for provider failure handling.
