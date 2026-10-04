@@ -15,11 +15,14 @@ import (
 )
 
 type stubLimiter struct {
-	decision rateDecision
-	err      error
-	calls    int
-	reserved int64
-	settled  []int64
+	decision      rateDecision
+	err           error
+	calls         int
+	reserved      int64
+	settled       []int64
+	tokenCalls    int
+	tokenDecision *rateDecision
+	tokenError    error
 }
 
 func (s *stubLimiter) Limit() int { return 60 }
@@ -29,7 +32,14 @@ func (s *stubLimiter) Reserve(_ context.Context, amount int64) (rateDecision, er
 	return s.decision, s.err
 }
 
-func (s *stubLimiter) TokenLimit() int  { return 60000 }
+func (s *stubLimiter) TokenLimit() int { return 60000 }
+func (s *stubLimiter) ReserveTokens(_ context.Context, _ int64) (rateDecision, error) {
+	s.tokenCalls++
+	if s.tokenDecision != nil {
+		return *s.tokenDecision, s.tokenError
+	}
+	return rateDecision{allowed: true, reservation: "fallback"}, s.tokenError
+}
 func (s *stubLimiter) OutputLimit() int { return 1024 }
 func (s *stubLimiter) Settle(_ context.Context, _ string, actual int64) error {
 	s.settled = append(s.settled, actual)

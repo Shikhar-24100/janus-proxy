@@ -3,7 +3,7 @@
 A Go LLM gateway built one working step at a time.
 
 Currently supports a local health endpoint and streaming or non-streaming chat requests to
-one OpenAI-compatible upstream, client authentication, and Redis RPM/TPM quotas
+an OpenAI-compatible primary and optional fallback, client authentication, and Redis RPM/TPM quotas
 with provider usage reconciliation.
 
 Provider calls also use an in-memory circuit breaker to stop repeatedly calling
@@ -66,7 +66,8 @@ path. Janus appends `/chat/completions`. Remote endpoints require HTTPS;
 loopback HTTP endpoints are allowed for development.
 
 Without `JANUS_API_KEY`, startup fails so chat access cannot accidentally be public.
-Without a provider key, `/health` still works, but authenticated valid chat requests return 503.
+Without a primary key, `/health` still works and chat can use a configured fallback;
+without either provider key, valid authenticated chat requests return 503.
 Keys belong in local environment variables, never in source or request JSON.
 
 ## Client authentication
@@ -246,8 +247,9 @@ interrupted streams and errors. Provider protocol:
 
 ```text
 Client -> router -> authentication -> JSON decoding and validation
-       -> Redis atomic RPM check + TPM reservation -> circuit breaker
-       -> provider HTTP call
+       -> Redis atomic RPM check + TPM reservation -> primary circuit breaker
+       -> primary provider call -> qualifying failure before streaming?
+       -> optional fallback TPM allocation + breaker + provider call
        <- provider's JSON response and HTTP status <-
        -> reconcile TPM from actual provider usage in Redis
 ```
@@ -293,15 +295,63 @@ Results from calls admitted before a state transition cannot alter the new state
 The breaker is guarded by a Go mutex and lives in each Janus process, not Redis.
 Restarting Janus resets it; separate instances have separate breakers. The mutex
 is held only for short state changes, never while waiting on HTTP. Calls already
-in flight can continue after the circuit opens. There are no retries or fallback
-providers in this step.
+in flight can continue after the circuit opens. The router can select the optional
+fallback while a primary circuit is open; it does not retry the same provider.
 
-Quota admission still runs first: a breaker-blocked call spends one RPM permit,
-then releases its TPM reservation because no upstream attempt happened.
+Quota admission runs first. With no fallback, a breaker-blocked call releases
+TPM because no upstream attempt happened; RPM remains spent. With fallback,
+the unused original TPM allocation is reused for that provider attempt.
 See [breaker examples and design](docs/circuit-breaker.md).
 
+## Groq to OpenAI fallback
+
+The primary settings remain `OPENAI_BASE_URL` and `OPENAI_API_KEY`; in our local
+setup these point to Groq. A non-empty `FALLBACK_API_KEY` enables one secondary
+OpenAI-compatible endpoint. `FALLBACK_BASE_URL` defaults to
+`https://api.openai.com/v1`; `FALLBACK_MODEL` defaults to `gpt-4o-mini`.
+Leave the fallback key empty to disable it. `run.ps1` loads all three settings.
+
+The primary receives the client's model unchanged. The fallback receives the
+same messages, stream settings, and output allowance with its configured model
+substituted. Responses retain the selected provider's actual model and JSON/SSE
+bytes. `X-Janus-Route: primary` or `fallback` identifies the selected route.
+This intentionally allows a different model to answer; quality can differ.
+
+Fallback can follow an open circuit, missing primary key, network failure,
+upstream timeout, 429/5xx, invalid buffered response, redirect, or invalid SSE
+content type before streaming begins. Other provider 4xx errors are returned
+unchanged. Client cancellation stops routing. There are at most two attempts,
+one per provider, with separate breakers and credentials. No provider error is
+sent to the client before deciding whether to fall back. Once primary SSE
+headers have been sent, an interrupted stream is aborted with no provider switch.
+If both providers fail, return the fallback's error/status and Retry-After.
+
+One client request spends one RPM permit. If primary was attempted, reconcile
+its usage separately, retaining its full reservation when usage is unknown.
+Then reserve another TPM allocation before calling fallback, without charging
+RPM again. Insufficient TPM returns a Janus 429; Redis failure returns 503.
+If primary was skipped, reuse the unspent original allocation. The original
+X-TokenLimit headers describe initial admission, not total fallback spend.
+
+Each provider attempt has its own 60-second timeout, so two slow attempts can
+take roughly 120 seconds. A shorter end-to-end routing deadline, capability
+mapping, load balancing, and durable cost accounting remain future work.
+
+For budget-conscious learning, the selected `gpt-4o-mini` model lists $0.15 per
+million input tokens and $0.60 per million output tokens. A 1000-input,
+500-output call is approximately $0.00045 at those uncached standard rates.
+Verify current prices in the
+[official model documentation](https://developers.openai.com/api/docs/models/gpt-4o-mini).
+Janus does not enforce dollar budgets; TPM is a token allocation limit.
+
+The ordinary test suite uses fake providers. `TestLiveOpenAIFallback` requires
+explicit `JANUS_LIVE_FALLBACK=1`, `FALLBACK_API_KEY`, and `REDIS_TEST_URL`.
+It simulates a primary failure and sends up to two billed OpenAI calls, each
+with a 32-token output cap. It never loads `.env` itself or prints credentials.
+See [fallback design and accounting examples](docs/fallback-routing.md).
+
 This is a local development gateway. Tenant management, accurate tokenization,
-fallback, caching, and durable usage analytics are future steps.
+caching, wider provider routing, and durable usage analytics are future steps.
 
 ## Check
 

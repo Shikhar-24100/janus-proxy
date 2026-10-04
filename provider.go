@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
-	"net"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,10 +16,12 @@ import (
 
 // Provider holds the configuration and reusable HTTP client for our upstream.
 type Provider struct {
-	endpoint string
-	apiKey   string
-	client   *http.Client
-	breaker  *circuitBreaker
+	endpoint      string
+	apiKey        string
+	client        *http.Client
+	breaker       *circuitBreaker
+	fallback      *Provider
+	fallbackModel string
 }
 
 func newProvider(baseURL, apiKey string) (*Provider, error) {
@@ -50,21 +52,24 @@ func newProvider(baseURL, apiKey string) (*Provider, error) {
 }
 
 func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input ChatRequest) {
+	p.routeChat(w, r, input)
+}
+
+// No response is committed on an attempt failure; the router can decide to
+// try another provider. Once streaming starts, this function never offers retry.
+func (p *Provider) tryChat(w http.ResponseWriter, r *http.Request, input ChatRequest) *attemptFailure {
 	if p.apiKey == "" {
-		writeGatewayError(w, http.StatusServiceUnavailable, "Provider API key is not configured.")
-		return
+		return gatewayFailure(503, "Provider API key is not configured.", true)
 	}
 
 	body, err := json.Marshal(input)
 	if err != nil {
-		writeGatewayError(w, http.StatusInternalServerError, "Could not encode provider request.")
-		return
+		return gatewayFailure(500, "Could not encode provider request.", false)
 	}
 	// Janus acts as a client here. The context cancels this call if our client disconnects.
 	upstreamRequest, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.endpoint, bytes.NewReader(body))
 	if err != nil {
-		writeGatewayError(w, http.StatusInternalServerError, "Could not create provider request.")
-		return
+		return gatewayFailure(500, "Could not create provider request.", false)
 	}
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Set("Authorization", "Bearer "+p.apiKey)
@@ -72,9 +77,9 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	generation, allowed, retry := p.breaker.acquire()
 	if !allowed {
 		seconds := (retry + time.Second - 1) / time.Second
-		w.Header().Set("Retry-After", strconv.FormatInt(int64(seconds), 10))
-		writeGatewayError(w, http.StatusServiceUnavailable, "Provider circuit is open; try again later.")
-		return
+		failure := gatewayFailure(503, "Provider circuit is open; try again later.", true)
+		failure.retryAfter = strconv.FormatInt(int64(seconds), 10)
+		return failure
 	}
 	outcome := breakerNeutral
 	defer func() {
@@ -90,8 +95,7 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		outcome = breakerFailure
-		p.writeUpstreamError(w, r, err)
-		return
+		return upstreamFailure(r, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500 {
@@ -99,12 +103,16 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	}
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		outcome = breakerFailure
-		writeGatewayError(w, http.StatusBadGateway, "Provider returned an unexpected redirect.")
-		return
+		return gatewayFailure(502, "Provider returned an unexpected redirect.", true)
 	}
 	if input.Stream && response.StatusCode == http.StatusOK {
+		mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
+		if mediaErr != nil || mediaType != "text/event-stream" {
+			outcome = breakerFailure
+			return gatewayFailure(502, "Provider did not return an SSE stream.", true)
+		}
 		p.forwardStream(w, r, response, &outcome)
-		return
+		return nil
 	}
 
 	// Complete JSON responses, including provider errors, use the buffered path.
@@ -112,13 +120,11 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
 		outcome = breakerFailure
-		p.writeUpstreamError(w, r, err)
-		return
+		return upstreamFailure(r, err)
 	}
 	if len(responseBody) > maxResponseBytes || !json.Valid(responseBody) {
 		outcome = breakerFailure
-		writeGatewayError(w, http.StatusBadGateway, "Provider returned an oversized or invalid JSON response.")
-		return
+		return gatewayFailure(502, "Provider returned an oversized or invalid JSON response.", true)
 	}
 	if outcome != breakerFailure {
 		// Non-429 client errors demonstrate reachability, not an outage.
@@ -129,6 +135,9 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	if state := accountingFrom(r); state != nil {
 		state.actual = reportedTokens(responseBody)
 	}
+	if response.StatusCode >= 400 {
+		return &attemptFailure{status: response.StatusCode, body: responseBody, retryAfter: response.Header.Get("Retry-After"), retryable: response.StatusCode == 429 || response.StatusCode >= 500}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if retryAfter := response.Header.Get("Retry-After"); retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
@@ -137,18 +146,7 @@ func (p *Provider) forwardChat(w http.ResponseWriter, r *http.Request, input Cha
 	if _, err := w.Write(responseBody); err != nil {
 		log.Println("Could not write provider response to client")
 	}
-}
-
-func (p *Provider) writeUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
-	if r.Context().Err() != nil {
-		return
-	}
-	var networkError net.Error
-	if errors.As(err, &networkError) && networkError.Timeout() {
-		writeGatewayError(w, http.StatusGatewayTimeout, "Provider request timed out.")
-		return
-	}
-	writeGatewayError(w, http.StatusBadGateway, "Could not complete provider request.")
+	return nil
 }
 
 func writeGatewayError(w http.ResponseWriter, status int, message string) {

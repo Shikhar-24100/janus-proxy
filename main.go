@@ -21,7 +21,10 @@ func main() {
 		log.Fatal(err)
 	}
 	if provider.apiKey == "" {
-		log.Println("OPENAI_API_KEY is unset; chat requests will return 503")
+		log.Println("OPENAI_API_KEY is unset; primary provider is unavailable")
+	}
+	if err := provider.configureFallback(os.Getenv("FALLBACK_BASE_URL"), os.Getenv("FALLBACK_API_KEY"), os.Getenv("FALLBACK_MODEL")); err != nil {
+		log.Fatal(err)
 	}
 
 	limiter, err := newRateLimiter(os.Getenv("REDIS_URL"), os.Getenv("RPM_LIMIT"), janusKey)

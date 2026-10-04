@@ -14,6 +14,7 @@ import (
 // Both admissions happen in one script: rejection consumes neither quota.
 var reserveQuotaScript = redis.NewScript(`
 local rpm, window, tpm, amount = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local spendRPM = tonumber(ARGV[6]) == 1
 local clock = redis.call('TIME')
 local now = math.floor(tonumber(clock[1])*1000 + tonumber(clock[2])/1000)
 local total = tonumber(redis.call('GET', KEYS[4])) or 0
@@ -32,7 +33,7 @@ tokens = math.min(rpm, tokens + math.max(0, now-updated)*rpm/window)
 if amount > tpm then return {0, math.floor(tokens), tpm-total, 0, 2} end
 local retry = 0
 local reason = 0
-if tokens < 1 then retry = math.ceil((1-tokens)*window/rpm); reason = 1 end
+if spendRPM and tokens < 1 then retry = math.ceil((1-tokens)*window/rpm); reason = 1 end
 if total+amount > tpm then
     local freed = 0
     local events = redis.call('ZRANGE', KEYS[2], 0, -1, 'WITHSCORES')
@@ -46,7 +47,7 @@ if total+amount > tpm then
     reason = 2
 end
 if reason ~= 0 then return {0, math.floor(tokens), math.max(0,tpm-total), math.max(1,retry), reason} end
-tokens = tokens-1
+if spendRPM then tokens = tokens-1 end
 redis.call('HSET', KEYS[1], 'tokens', tokens, 'updated_ms', math.max(now,updated))
 if amount > 0 then
     redis.call('ZADD', KEYS[2], now, ARGV[5])
@@ -83,6 +84,15 @@ func (l *RateLimiter) TokenLimit() int  { return l.tpm }
 func (l *RateLimiter) OutputLimit() int { return l.outputLimit }
 
 func (l *RateLimiter) Reserve(ctx context.Context, amount int64) (rateDecision, error) {
+	return l.reserve(ctx, amount, 1)
+}
+
+// A fallback is another token allocation, not another client request.
+func (l *RateLimiter) ReserveTokens(ctx context.Context, amount int64) (rateDecision, error) {
+	return l.reserve(ctx, amount, 0)
+}
+
+func (l *RateLimiter) reserve(ctx context.Context, amount int64, spendRPM int) (rateDecision, error) {
 	if amount < 0 {
 		return rateDecision{}, fmt.Errorf("negative reservation")
 	}
@@ -93,7 +103,7 @@ func (l *RateLimiter) Reserve(ctx context.Context, amount int64) (rateDecision, 
 	id := hex.EncodeToString(idBytes)
 	ctx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
 	defer cancel()
-	result, err := reserveQuotaScript.Run(ctx, l.client, l.quotaKeys(), l.rpm, l.period.Milliseconds(), l.tpm, amount, id).Int64Slice()
+	result, err := reserveQuotaScript.Run(ctx, l.client, l.quotaKeys(), l.rpm, l.period.Milliseconds(), l.tpm, amount, id, spendRPM).Int64Slice()
 	if err != nil {
 		return rateDecision{}, err
 	}

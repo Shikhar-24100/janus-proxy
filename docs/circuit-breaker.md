@@ -52,13 +52,14 @@ the breaker can recover while TPM remains conservatively reserved.
 authenticate -> validate -> RPM + TPM admission -> breaker -> provider
 ```
 
-Blocked by breaker: no provider attempt, so release TPM to zero. RPM remains
-spent. An uncertain upstream failure keeps TPM reserved under our existing
-accounting policy. No provider switch is attempted after streaming begins.
+Blocked by primary breaker: reuse the original TPM allocation for configured
+fallback. Without fallback, release TPM to zero. RPM remains spent. An uncertain
+upstream failure keeps its own TPM allocation reserved; an additional fallback
+allocation is required. No provider switch occurs after streaming begins.
 
 One breaker lives in each Provider object in Janus memory. Restarting Janus
 resets it, and multiple gateway processes do not share breaker state. Existing
 calls can finish after opening. Defaults are fixed at five failures and 30
-seconds for this step. Routing, provider-specific backoff, metrics, and fallback
-remain future work. The retry hint during a running probe is one second, not
+seconds. Optional fallback routing is implemented. Provider-specific backoff,
+load balancing, and metrics remain future work. The retry hint during a running probe is one second, not
 a promised recovery time.

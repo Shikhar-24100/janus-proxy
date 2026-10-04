@@ -21,10 +21,17 @@ Atomic quota admission <----> Redis
   | TPM: rolling 60-second ledger of token charges
   | exhausted -> 429 + Retry-After; unavailable -> 503
   v
-Circuit breaker (inside Janus memory)
-  | open / another probe running -> 503; release reserved TPM
+Primary circuit breaker (inside Janus memory)
+  | open / another probe running -> try configured fallback
   v
-Provider HTTP client (separate Groq key) -> Groq
+Primary HTTP client (Groq key) -> Groq
+  | qualifying failure before streaming starts
+  v
+Fallback router -> reserve more TPM if primary was attempted
+  | skipped primary -> reuse original allocation
+  | insufficient token quota -> 429; Redis unavailable -> 503
+  v
+Fallback breaker + HTTP client (OpenAI key) -> configured fallback model
   |
   +-> complete JSON -> bounded read -> client response
   +-> SSE -> read / observe usage / write / flush -> client stream
@@ -56,21 +63,21 @@ heuristic; accurate model tokenizers remain future work.
 
 ## Rough progress estimate
 
-About **40% of the first production-focused version** after token reservations
-and reconciliation. This is an effort estimate, not a measured percentage or
+About **45% of the first production-focused version** after adding two-provider
+fallback. This is an effort estimate, not a measured percentage or
 production-readiness claim. Optional semantic caching is outside this scope.
 
 | Area | Status |
 | --- | --- |
 | API and validation | Basic text-only subset |
-| Provider calls | One compatible upstream; live Groq verified |
+| Provider calls | Compatible primary + optional fallback; live Groq verified |
 | SSE streaming | Forwarding, flushing, cancellation, failure tests |
 | Authentication | One shared key; no tenant registry |
 | RPM | Atomic Redis bucket |
 | TPM | Rolling reservations and actual usage settlement |
 | Tokenization | Byte heuristic; model tokenizer still needed |
 | Exact caching | Not built |
-| Provider resilience | Circuit breaker built; routing and fallback still needed |
+| Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Individual keys, budgets, revocation still needed |
 | Durable usage pipeline | Event delivery and analytics storage still needed |
 | Operations | Metrics, load tests, measured latency, hardening still needed |
@@ -82,3 +89,4 @@ persistence, replication, and durable billing remain future work.
 
 See [token accounting maths](token-accounting.md) for worked examples.
 See [circuit breaker design](circuit-breaker.md) for provider failure handling.
+See [fallback routing](fallback-routing.md) for multi-attempt accounting.

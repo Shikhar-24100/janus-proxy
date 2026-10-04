@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -18,9 +20,32 @@ func estimateInputTokens(input ChatRequest) int64 {
 
 type accountingKey struct{}
 type requestAccounting struct {
-	input     ChatRequest
-	attempted bool
-	actual    *int64
+	input       ChatRequest
+	attempted   bool
+	actual      *int64
+	limiter     requestLimiter
+	reservation string
+	reserved    int64
+	settled     bool
+}
+
+func (s *requestAccounting) settle() {
+	if s.settled {
+		return
+	}
+	s.settled = true
+	actual := s.actual
+	if !s.attempted {
+		zero := int64(0)
+		actual = &zero
+	}
+	if actual == nil {
+		log.Println("Provider usage unavailable; retaining token reservation")
+		return
+	}
+	if err := s.limiter.Settle(context.Background(), s.reservation, *actual); err != nil {
+		log.Println("Token reconciliation failed; reservation remains conservative")
+	}
 }
 
 func accountingFrom(r *http.Request) *requestAccounting {

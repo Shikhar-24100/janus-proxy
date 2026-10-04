@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -23,6 +22,7 @@ type rateDecision struct {
 
 type requestLimiter interface {
 	Reserve(context.Context, int64) (rateDecision, error)
+	ReserveTokens(context.Context, int64) (rateDecision, error)
 	Settle(context.Context, string, int64) error
 	Limit() int
 	TokenLimit() int
@@ -112,21 +112,8 @@ func limitRequests(limiter requestLimiter, next http.Handler) http.Handler {
 			})
 			return
 		}
-		state := &requestAccounting{input: input}
-		defer func() {
-			actual := state.actual
-			if !state.attempted {
-				zero := int64(0)
-				actual = &zero
-			}
-			if actual == nil {
-				log.Println("Provider usage unavailable; retaining token reservation")
-				return
-			}
-			if err := limiter.Settle(context.Background(), decision.reservation, *actual); err != nil {
-				log.Println("Token reconciliation failed; reservation remains conservative")
-			}
-		}()
+		state := &requestAccounting{input: input, limiter: limiter, reservation: decision.reservation, reserved: reserved}
+		defer state.settle()
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), accountingKey{}, state)))
 	})
 }

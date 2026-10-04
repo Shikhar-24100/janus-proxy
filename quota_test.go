@@ -124,3 +124,25 @@ func TestRedisRPMRejectDoesNotChargeTPM(t *testing.T) {
 		t.Fatalf("RPM rejection charged TPM: %+v %v", second, err)
 	}
 }
+
+func TestRedisFallbackTokensWithoutRPM(t *testing.T) {
+	l := testQuota(t, "1", 1000)
+	ctx := context.Background()
+	first, err := l.Reserve(ctx, 600)
+	if err != nil || !first.allowed {
+		t.Fatal("primary reservation failed", err)
+	}
+	fallback, err := l.ReserveTokens(ctx, 400)
+	if err != nil || !fallback.allowed || fallback.remaining != 0 || fallback.tokenRemaining != 0 {
+		t.Fatalf("fallback=%+v err=%v", fallback, err)
+	}
+	denied, err := l.ReserveTokens(ctx, 1)
+	if err != nil || denied.allowed || !denied.tokenDenied {
+		t.Fatal("fallback bypassed TPM")
+	}
+	l.Settle(ctx, fallback.reservation, 100)
+	total, err := l.client.Get(ctx, l.quotaKeys()[3]).Int64()
+	if err != nil || total != 700 {
+		t.Fatalf("unknown primary charge lost: %d %v", total, err)
+	}
+}
