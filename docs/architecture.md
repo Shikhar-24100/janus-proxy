@@ -93,7 +93,7 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Startup registry, isolated quotas/cache, rotation and disabling; dollar budgets and live administration remain |
 | Durable usage pipeline | Persistent Redis Stream, retrying PostgreSQL worker, deduplication and daily reports; pre-enqueue crash gaps remain |
-| Operations | Request logs and metrics built; load tests, measured overhead, hardening remain |
+| Operations | Logs/metrics and local percentile benchmark built; full measurements, deployment hardening and production load tests remain |
 
 Tests cover concurrency, refunds, duplicate/late settlement, underestimated
 usage, missing usage, fragmented SSE, and output bounds. Settlement is currently
@@ -107,3 +107,4 @@ See [observability](observability.md) for TTFT, logs, metrics, and limitations.
 See [caching](caching.md) for eligibility, quota behavior, and test commands.
 See [tenants](tenants.md) for identity, configuration, isolation, and rotation.
 See [usage storage](usage-storage.md) for PostgreSQL, async workers and reliability limits.
+See [performance](performance.md) for p50/p99, benchmark modes and interpretation.

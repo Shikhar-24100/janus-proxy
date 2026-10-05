@@ -50,6 +50,12 @@ type usagePipeline struct {
 }
 
 func newUsagePipeline(ctx context.Context, redisURL string, store usageStore) (*usagePipeline, error) {
+	return newUsagePipelineWithStream(ctx, redisURL, store, usageStream)
+}
+
+// An isolated stream lets local benchmarks exercise the real worker without
+// consuming production events. The normal gateway always uses usageStream.
+func newUsagePipelineWithStream(ctx context.Context, redisURL string, store usageStore, stream string) (*usagePipeline, error) {
 	options, err := redis.ParseURL(redisURL)
 	if err != nil {
 		return nil, errors.New("USAGE_REDIS_URL is invalid")
@@ -62,7 +68,7 @@ func newUsagePipeline(ctx context.Context, redisURL string, store usageStore) (*
 	options.PoolTimeout = 200 * time.Millisecond
 	options.PoolSize = 4
 	options.MaxActiveConns = 4
-	p := &usagePipeline{client: redis.NewClient(options), store: store, stream: usageStream, group: usageGroup, consumer: rand.Text(), claimIdle: 30 * time.Second, capacity: maxUsageQueue}
+	p := &usagePipeline{client: redis.NewClient(options), store: store, stream: stream, group: usageGroup, consumer: rand.Text(), claimIdle: 30 * time.Second, capacity: maxUsageQueue}
 	if err := p.initialize(ctx); err != nil {
 		p.client.Close()
 		return nil, errors.New("cannot initialize usage queue")

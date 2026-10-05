@@ -430,6 +430,16 @@ unknown usage stays NULL. `.\usage-report.ps1` shows daily totals per tenant.
 Enqueue failures are visible in logs/metrics and can leave accounting gaps;
 crashes before enqueue are not covered. See [worker design, setup and limitations](docs/usage-storage.md).
 
+## Local performance benchmark
+
+`.\benchmark.ps1 -Mode full -Requests 500 -Concurrency 1,16` compares a local fake
+provider with Janus, measuring JSON latency, streaming first-text latency,
+p50/p99, throughput, failures and usage backlog. It uses real Redis/PostgreSQL
+with isolated benchmark state and makes no billed provider calls.
+Use `-Mode core` to measure HTTP/auth/routing/SSE without those services;
+core results do not validate full gateway overhead. Reports are in `.cache/perf`.
+See [percentiles, benchmark scenarios and interpretation](docs/performance.md).
+
 ## Check
 
 ```powershell
