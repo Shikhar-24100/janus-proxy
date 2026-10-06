@@ -12,6 +12,11 @@ an upstream that is failing.
 
 ## Run
 
+For the Linux container stack, see [the container design and commands](docs/containers.md).
+Run `.\containers.ps1 -Action init` once, then `.\containers.ps1 -Action up`
+to run Janus on localhost:8081 alongside isolated
+Redis/PostgreSQL containers. The existing Windows setup below uses port 8080.
+
 See [startup checks and WSL troubleshooting](docs/startup.md) if a local service
 fails to start. The scripts distinguish WSL startup failure from Linux service
 failures and reuse already responding project Redis instances.

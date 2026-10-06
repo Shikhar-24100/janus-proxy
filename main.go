@@ -91,7 +91,11 @@ func main() {
 
 	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	server := &http.Server{Addr: "127.0.0.1:8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	address := os.Getenv("LISTEN_ADDR")
+	if address == "" {
+		address = "127.0.0.1:8080"
+	}
+	server := &http.Server{Addr: address, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -102,7 +106,7 @@ func main() {
 			_ = server.Close()
 		}
 	}()
-	log.Println("Janus proxy listening on http://localhost:8080")
+	log.Printf("Janus proxy listening on %s", server.Addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

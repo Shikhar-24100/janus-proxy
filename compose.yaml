@@ -1,0 +1,102 @@
+name: janus-linux
+
+services:
+  janus:
+    build:
+      context: .
+      target: runtime
+    env_file: .env.container
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      REDIS_URL: redis://quota-redis:6379/0
+      USAGE_REDIS_URL: redis://usage-redis:6379/0
+      DATABASE_URL: postgres://janus:${POSTGRES_PASSWORD:?Run containers.ps1 -Action init first}@postgres:5432/janus?sslmode=disable
+      TENANTS_CONFIG: /app/config/tenants.json
+    ports:
+      - "127.0.0.1:${JANUS_HTTP_PORT:-8081}:8080"
+    volumes:
+      - ./.container/tenants.json:/app/config/tenants.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    stop_grace_period: 15s
+    depends_on:
+      quota-redis:
+        condition: service_healthy
+      usage-redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/health]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  quota-redis:
+    image: redis:7.4.11-alpine
+    command: [redis-server, --save, "", --appendonly, "no", --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  usage-redis:
+    image: redis:7.4.11-alpine
+    command: [redis-server, --save, "", --appendonly, "yes", --appendfsync, always, --maxmemory, 64mb, --maxmemory-policy, noeviction]
+    volumes:
+      - usage-data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16.15-alpine
+    environment:
+      POSTGRES_USER: janus
+      POSTGRES_DB: janus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run containers.ps1 -Action init first}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U janus -d janus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  tools:
+    profiles: [tools]
+    build:
+      context: .
+      target: build
+    environment:
+      REDIS_TEST_URL: redis://quota-redis:6379/0
+      POSTGRES_TEST_URL: postgres://janus:${POSTGRES_PASSWORD:?Run containers.ps1 -Action init first}@postgres:5432/janus?sslmode=disable
+      JANUS_PERF_REDIS_URL: redis://quota-redis:6379/0
+      JANUS_PERF_USAGE_REDIS_URL: redis://usage-redis:6379/0
+      JANUS_PERF_DATABASE_URL: postgres://janus:${POSTGRES_PASSWORD:?Run containers.ps1 -Action init first}@postgres:5432/janus?sslmode=disable
+    volumes:
+      - ./.cache/perf-linux:/src/.cache/perf
+    depends_on:
+      quota-redis:
+        condition: service_healthy
+      usage-redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: [go, test, -p, "1", -count=1, ./...]
+
+volumes:
+  usage-data:
+  postgres-data:

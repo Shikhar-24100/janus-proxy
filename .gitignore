@@ -8,6 +8,7 @@
 .env.*
 !.env.example
 tenants.local.json
+.container/
 
 # Machine-specific editor settings.
 .vscode/settings.json

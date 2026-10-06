@@ -204,6 +204,19 @@ disk latency, and use longer controlled arrival-rate loads. Cache p99 and worker
 drain throughput remain important targets; lowering durability to win the
 benchmark is not part of this pass.
 
+## Linux container baseline
+
+The container stack adds `.\containers.ps1 -Action benchmark`, which runs this
+same harness inside Linux with real dependency containers. Reports are written
+to `.cache/perf-linux/latest-full.*`, preserving the Windows artifacts.
+The first full run completed 7000 measured requests with no request, enqueue or
+worker errors and empty queues after draining. At GOMAXPROCS=2, full JSON p50
+was 13.04 ms versus direct 10.62 ms at concurrency 1, and 13.76 ms versus direct
+10.92 ms at concurrency 16. Differences between medians are 2.42/2.84 ms for this
+workload. It still uses a same-process load generator/mock gateway, not the
+independently running container on port 8081. See [container notes](containers.md)
+for setup, exact measurements and remaining separate-process testing.
+
 ## WSL startup history
 
 On the October 6, 2026 session, Ubuntu WSL could not start with
