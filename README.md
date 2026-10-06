@@ -13,6 +13,8 @@ an upstream that is failing.
 ## Run
 
 For the Linux container stack, see [the container design and commands](docs/containers.md).
+For independent client/provider/gateway containers, run `.\loadtest.ps1` and see
+[load-test design, results and limits](docs/load-testing.md).
 Run `.\containers.ps1 -Action init` once, then `.\containers.ps1 -Action up`
 to run Janus on localhost:8081 alongside isolated
 Redis/PostgreSQL containers. The existing Windows setup below uses port 8080.

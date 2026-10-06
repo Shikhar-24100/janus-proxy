@@ -6,12 +6,22 @@ RUN go mod download
 COPY *.go ./
 COPY migrations/ ./migrations/
 COPY queries/ ./queries/
+COPY cmd/loadtest/ ./cmd/loadtest/
 
 FROM build AS test
 RUN go test -p 1 ./...
 
 FROM build AS binary
 RUN CGO_ENABLED=0 go build -p 1 -trimpath -ldflags="-s -w" -o /out/janus .
+
+FROM build AS load-binary
+RUN CGO_ENABLED=0 go build -p 1 -trimpath -o /out/loadtest ./cmd/loadtest
+
+FROM alpine:3.24 AS loadtool
+RUN apk add --no-cache ca-certificates && addgroup -g 10001 janus && adduser -D -H -u 10001 -G janus janus
+COPY --from=load-binary /out/loadtest /app/loadtest
+USER 10001:10001
+ENTRYPOINT ["/app/loadtest"]
 
 FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ca-certificates && addgroup -g 10001 janus && adduser -D -H -u 10001 -G janus janus

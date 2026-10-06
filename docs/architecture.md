@@ -93,7 +93,7 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Startup registry, isolated quotas/cache, rotation and disabling; dollar budgets and live administration remain |
 | Durable usage pipeline | Persistent Redis Stream, retrying PostgreSQL worker, deduplication and daily reports; pre-enqueue crash gaps remain |
-| Operations | Logs/metrics, stage timings, local Windows/Linux benchmarks, optimization pass and Linux Compose stack verified; deployment hardening and separate-process production load tests remain |
+| Operations | Logs/metrics, stage timings, Windows/Linux benchmarks, Linux Compose and separate-container open-loop loads; deployment hardening, overload accounting and production soak tests remain |
 
 Tests cover concurrency, refunds, duplicate/late settlement, underestimated
 usage, missing usage, fragmented SSE, and output bounds. Settlement is currently
@@ -109,3 +109,5 @@ See [tenants](tenants.md) for identity, configuration, isolation, and rotation.
 See [usage storage](usage-storage.md) for PostgreSQL, async workers and reliability limits.
 See [performance](performance.md) for p50/p99, benchmark modes and interpretation.
 See [Linux containers](containers.md) for the Compose topology, storage and startup.
+See [separate-container load testing](load-testing.md) for fixed-rate traffic,
+gateway CPU/memory, usage verification and observed overload limits.

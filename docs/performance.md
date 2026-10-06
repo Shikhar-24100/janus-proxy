@@ -206,6 +206,9 @@ benchmark is not part of this pass.
 
 ## Linux container baseline
 
+For open-loop tests of the actual runtime container with a separate provider and
+load generator, see [separate-container load testing](load-testing.md).
+
 The container stack adds `.\containers.ps1 -Action benchmark`, which runs this
 same harness inside Linux with real dependency containers. Reports are written
 to `.cache/perf-linux/latest-full.*`, preserving the Windows artifacts.

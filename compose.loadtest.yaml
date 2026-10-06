@@ -1,0 +1,89 @@
+# Isolated fixtures: no .env files, real keys, host ports, or Internet routes.
+name: janus-loadtest
+services:
+  cert:
+    build: {context: ., target: loadtool}
+    user: "0:0"
+    command: [cert]
+    volumes: ["certs:/certs"]
+  fake-provider:
+    build: {context: ., target: loadtool}
+    command: [fake]
+    volumes: ["certs:/certs:ro"]
+    cpus: 1
+    mem_limit: 128m
+    depends_on:
+      cert: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, /app/loadtest, check]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  gateway:
+    build: {context: ., target: runtime}
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENAI_BASE_URL: https://fake-provider:8443/v1
+      OPENAI_API_KEY: fixture-provider-key
+      JANUS_API_KEY: fixture-client-key
+      FALLBACK_API_KEY: ""
+      REDIS_URL: redis://quota-redis:6379/0
+      USAGE_REDIS_URL: redis://usage-redis:6379/0
+      DATABASE_URL: postgres://janus:fixture-password@postgres:5432/janus?sslmode=disable
+      RPM_LIMIT: "1000000"
+      TPM_LIMIT: "100000000"
+      MAX_OUTPUT_TOKENS: "64"
+      SSL_CERT_FILE: /certs/cert.pem
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: 192MiB
+    volumes: ["certs:/certs:ro"]
+    cpus: 2
+    mem_limit: 256m
+    depends_on:
+      fake-provider: {condition: service_healthy}
+      quota-redis: {condition: service_healthy}
+      usage-redis: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/health]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "2"}
+  quota-redis:
+    image: redis:7.4.11-alpine
+    command: [redis-server, --save, "", --appendonly, "no", --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    healthcheck: &redis-health
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  usage-redis:
+    image: redis:7.4.11-alpine
+    command: [redis-server, --save, "", --appendonly, "yes", --appendfsync, always, --maxmemory, 64mb, --maxmemory-policy, noeviction]
+    volumes: ["usage:/data"]
+    healthcheck: *redis-health
+  postgres:
+    image: postgres:16.15-alpine
+    environment: {POSTGRES_USER: janus, POSTGRES_DB: janus, POSTGRES_PASSWORD: fixture-password}
+    volumes: ["database:/var/lib/postgresql/data"]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U janus -d janus]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  load:
+    profiles: [tools]
+    build: {context: ., target: loadtool}
+    volumes: ["certs:/certs:ro", "./.cache/loadtest:/reports"]
+    cpus: 2
+    mem_limit: 512m
+    environment: {GOMAXPROCS: "2"}
+networks:
+  default: {internal: true}
+volumes:
+  certs:
+  usage:
+  database:

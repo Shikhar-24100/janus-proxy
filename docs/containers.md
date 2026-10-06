@@ -199,8 +199,10 @@ The local median differences fall within the original 5-10 ms goal for this
 small workload. They are not per-request overhead percentiles or a guarantee
 for real providers, long streams, sustained arrival rates or the runtime container.
 This first run changes OS, filesystem and network together; it cannot attribute
-all improvement specifically to Windows/WSL round trips. The separate-process
-load test is still needed. Reports are `.cache/perf-linux/latest-full.*`.
+all improvement specifically to Windows/WSL round trips. Reports are
+`.cache/perf-linux/latest-full.*`. The newer
+[separate-container load test](load-testing.md) exercises the actual runtime
+image and records its CPU/memory and usage backlog under fixed-rate traffic.
 
 Official references:
 

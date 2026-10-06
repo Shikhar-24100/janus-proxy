@@ -39,6 +39,10 @@
 !migrations/**
 !queries/
 !queries/**
+!cmd/
+!cmd/loadtest/
+!cmd/loadtest/main.go
+!cmd/loadtest/main_test.go
 
 # Prune large local directories without traversing their nested Go files.
 .cache/
