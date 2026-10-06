@@ -33,6 +33,7 @@ services:
       RPM_LIMIT: "1000000"
       TPM_LIMIT: "100000000"
       MAX_OUTPUT_TOKENS: "64"
+      MAX_INFLIGHT: "32"
       SSL_CERT_FILE: /certs/cert.pem
       GOMAXPROCS: "2"
       GOMEMLIMIT: 192MiB

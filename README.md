@@ -6,6 +6,8 @@ Currently supports a local health endpoint and streaming or non-streaming chat r
 an OpenAI-compatible primary and optional fallback, client authentication, and Redis RPM/TPM quotas
 with provider usage reconciliation.
 Optional persistent Redis Streams and a PostgreSQL worker retain tenant usage history.
+`MAX_INFLIGHT` caps simultaneous work (default 32); overload returns 503 before
+provider calls. See [admission and usage recovery](docs/overload-protection.md).
 
 Provider calls also use an in-memory circuit breaker to stop repeatedly calling
 an upstream that is failing.

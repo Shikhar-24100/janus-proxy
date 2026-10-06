@@ -166,6 +166,7 @@ type sample struct {
 	Error              string
 }
 type phase struct {
+	Rejected                                                 int
 	Name                                                     string `json:"name"`
 	Rate                                                     int    `json:"target_rps"`
 	Start, End                                               time.Time
@@ -180,6 +181,7 @@ type phase struct {
 	ValidationErrors                                         []string
 }
 type report struct {
+	AllowOverload                bool
 	DurationSeconds, MaxInflight int
 	Phases                       []phase
 	Completed, Passed            bool
@@ -276,7 +278,19 @@ func request(c *http.Client, url string, stream bool, scheduled time.Time) sampl
 	}
 	defer resp.Body.Close()
 	s.Status = resp.StatusCode
-	if resp.StatusCode != 200 {
+	if resp.StatusCode == 503 {
+		data, e := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		var body struct {
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		if e == nil && json.Unmarshal(data, &body) == nil && body.Error.Type == "overloaded_error" && resp.Header.Get("Retry-After") == "1" {
+			s.Error = "overloaded"
+		} else {
+			s.Error = "http"
+		}
+	} else if resp.StatusCode != 200 {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		s.Error = "http"
 	} else if stream {
@@ -336,7 +350,7 @@ func settled(c *http.Client, queue *redis.Client) (map[string]float64, int64, er
 		if err != nil {
 			return nil, 0, err
 		}
-		if m["janus_chat_inflight"] == 0 && n == 0 && m["janus_usage_persisted_total"] >= m["janus_usage_enqueued_total"] {
+		if m["janus_chat_inflight"] == 0 && m["janus_admission_active"] == 0 && m["janus_usage_pending_handoffs"] == 0 && n == 0 && m["janus_usage_persisted_total"] >= m["janus_usage_enqueued_total"] {
 			return m, n, nil
 		}
 		if time.Now().After(deadline) {
@@ -351,6 +365,7 @@ func run() error {
 	duration := flags.Int("duration", 10, "seconds per phase")
 	max := flags.Int("inflight", 256, "maximum client concurrency")
 	ratesText := flags.String("rates", "50,200,500", "requests per second")
+	allowOverload := flags.Bool("allow-overload", false, "allow deliberate gateway 503 rejections; still validate every admitted response and usage record")
 	if err := flags.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -384,7 +399,7 @@ func run() error {
 	csvw := csv.NewWriter(raw)
 	defer csvw.Flush()
 	csvw.Write([]string{"phase", "target_rps", "scheduled_latency_ms", "scheduled_ttft_ms", "scheduler_lag_ms", "status", "error"})
-	result := report{DurationSeconds: *duration, MaxInflight: *max}
+	result := report{DurationSeconds: *duration, MaxInflight: *max, AllowOverload: *allowOverload}
 	if err := save(result); err != nil {
 		return err
 	}
@@ -448,7 +463,12 @@ func run() error {
 			var latency, ttft, lag []float64
 			for _, s := range samples {
 				lag = append(lag, s.Lag)
-				if s.Error != "" {
+				if s.Error == "overloaded" && strings.HasPrefix(p.Name, "gateway") {
+					p.Rejected++
+					if !*allowOverload {
+						p.Errors++
+					}
+				} else if s.Error != "" {
 					p.Errors++
 				} else {
 					p.Success++
@@ -489,6 +509,10 @@ func run() error {
 				failed = true
 				p.ValidationErrors = append(p.ValidationErrors, fmt.Sprintf("%d response errors/drops", p.Errors))
 			}
+			if strings.HasPrefix(p.Name, "gateway") && (p.Success == 0 || after["janus_overload_rejections_total"]-before["janus_overload_rejections_total"] != float64(p.Rejected)) {
+				failed = true
+				p.ValidationErrors = append(p.ValidationErrors, "no admitted responses or overload counter mismatch")
+			}
 			for _, key := range []string{"janus_usage_enqueue_errors_total", "janus_usage_worker_errors_total", "janus_usage_invalid_events_total"} {
 				if after[key] > before[key] {
 					failed = true
@@ -502,7 +526,7 @@ func run() error {
 				p.ValidationErrors = append(p.ValidationErrors, "usage handoff count mismatch")
 			}
 			result.Phases = append(result.Phases, p)
-			fmt.Printf("%s %d rps: %d/%d successful, p50 %.2f ms p99 %.2f ms, backlog %d\n", p.Name, rate, p.Success, p.Scheduled, p.P50MS, p.P99MS, p.Backlog)
+			fmt.Printf("%s %d rps: %d/%d successful, %d rejected, p50 %.2f ms p99 %.2f ms, backlog %d\n", p.Name, rate, p.Success, p.Scheduled, p.Rejected, p.P50MS, p.P99MS, p.Backlog)
 			if err := save(result); err != nil {
 				return err
 			}
@@ -613,7 +637,7 @@ func summarize() error {
 	}
 	var out bytes.Buffer
 	fmt.Fprintf(&out, "# Separate-container load test\n\n%d seconds per phase; max %d inflight. Latency and TTFT include client scheduling lag. Failed requests are excluded from percentiles and counted separately.\n\n", r.DurationSeconds, r.MaxInflight)
-	fmt.Fprintf(&out, "Completed: %t. Passed all response and usage checks: %t.\n\n", r.Completed, r.Passed)
+	fmt.Fprintf(&out, "Completed: %t. Passed all response and usage checks: %t. Deliberate gateway overload rejections allowed: %t.\n\n", r.Completed, r.Passed, r.AllowOverload)
 	fmt.Fprintln(&out, "| Phase | Target RPS | Successful / scheduled | Actual RPS | p50 / p99 ms | TTFT p50 / p99 ms | Lag p99 ms | CPU avg / max % | Memory max MiB | Samples | Backlog sampled max / EOF |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 	for i := range r.Phases {
 		p := &r.Phases[i]
@@ -623,6 +647,9 @@ func summarize() error {
 		fmt.Fprintf(&out, "| %s | %d | %d / %d | %.1f | %.2f / %.2f | %.2f / %.2f | %.2f | %.1f / %.1f | %.1f | %d | %d / %d |\n", p.Name, p.Rate, p.Success, p.Scheduled, p.Throughput, p.P50MS, p.P99MS, p.TTFTP50MS, p.TTFTP99MS, p.LagP99MS, p.CPUAverage, p.CPUMax, p.MemoryMaxMiB, p.ResourceSamples, p.BacklogMax, p.Backlog)
 	}
 	for _, p := range r.Phases {
+		if p.Rejected > 0 {
+			fmt.Fprintf(&out, "\n%s at %d RPS: %d deliberate overload rejections (excluded from successful latency percentiles).\n", p.Name, p.Rate, p.Rejected)
+		}
 		if len(p.ValidationErrors) > 0 {
 			fmt.Fprintf(&out, "\n%s at %d RPS: %s.\n", p.Name, p.Rate, strings.Join(p.ValidationErrors, "; "))
 		}

@@ -135,9 +135,9 @@ func (registry *tenantRegistry) authenticate(next http.Handler) http.Handler {
 
 func newTenantMux(provider *Provider, adminKey string, registry *tenantRegistry, observability *telemetry) *http.ServeMux {
 	mux := newOperationalMux(provider, adminKey, observability)
-	chat := registry.authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	chat := registry.authenticate(observability.admit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tenantFrom(r).handler.ServeHTTP(w, r)
-	}))
+	})))
 	mux.Handle("POST /v1/chat/completions", observability.observe(chat))
 	return mux
 }

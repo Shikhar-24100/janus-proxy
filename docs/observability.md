@@ -23,7 +23,9 @@ GET /metrics + Janus key -> read metrics and breaker snapshots
 | Reported token counters | Valid prompt, completion, and total usage for each route |
 | Unknown usage counter | Contacted providers without trustworthy final usage |
 | Fallback selections | Requests selecting fallback, even if its circuit blocks the call |
-| In-flight gauge | Chat handlers still running |
+| In-flight gauge | Unfinished chat observations; use admission active for held seats |
+| Admission metrics | Configured/held seats and early overload rejections |
+| Usage retry metrics | Pending handoffs, retry triggers and terminal failures |
 | Duration histogram | Time from chat handler entry until quota settlement finishes |
 | TTFT histogram | Time until Janus flushes the first recognized non-empty text delta |
 | Circuit state gauge | Closed=0, open=1, half-open=2 for each configured route |
@@ -54,8 +56,11 @@ The three stage families are `janus_quota_admission_duration_seconds`,
 `_count`. For example, enqueue `_sum / _count * 1000` gives its mean operation
 duration in milliseconds. Admission includes extra cache-miss/fallback token
 reservations; counts are operations, not necessarily one per request. Enqueue
-counts only tenant-attributed requests when usage storage is enabled. Settlement
-does not run when provider usage is unknown. Cache, HTTP and provider generation
+counts only tenant-attributed requests when usage storage is enabled.
+Overload rejections do not enqueue usage. This histogram measures the initial
+handoff/retention step; background retry time is visible through pending jobs,
+not added to the same histogram. See [admission and retry design](overload-protection.md).
+Settlement does not run when provider usage is unknown. Cache, HTTP and provider generation
 contribute additional time outside these three stages. Sub-millisecond buckets
 make fast local operations visible.
 

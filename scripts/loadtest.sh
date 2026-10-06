@@ -4,6 +4,7 @@ cd "$1"
 duration="$2"
 rates="$3"
 inflight="$4"
+overload="$5"
 mkdir -p .cache/loadtest
 compose() { docker compose -p janus-loadtest -f compose.loadtest.yaml "$@"; }
 # Reset only this fixture stack's processes. Its private database can retain rows.
@@ -24,7 +25,7 @@ sampler=$!
 cleanup() { kill "$sampler" 2>/dev/null || true; wait "$sampler" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 status=0
-compose run --rm load run --duration "$duration" --rates "$rates" --inflight "$inflight" || status=$?
+compose run --rm load run --duration "$duration" --rates "$rates" --inflight "$inflight" --allow-overload="$overload" || status=$?
 cleanup
 trap - EXIT INT TERM
 compose run --rm load summarize || status=$?

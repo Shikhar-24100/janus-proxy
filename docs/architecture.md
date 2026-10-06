@@ -11,6 +11,8 @@ Router -> telemetry wrapper (request ID, timer) -> tenant authentication
   | missing/wrong key -> 401; public /health bypasses quotas
   v
 Attach trusted tenant to context; validate JSON and tenant output allowance
+  | concurrency gate before validation: full/pending usage handoff -> 503
+  | admitted seat stays held until completion and usage confirmation
   | invalid -> 400; oversized body -> 413
   v
 Estimate input + output allowance
@@ -47,6 +49,7 @@ Handler completion -> settle actual usage in Redis
   v
 Update metrics -> enqueue JSON request log -> background console writer
                -> bounded persistent Redis usage enqueue (separate 6381 server)
+                  -> unconfirmed: retain event/seat, pause admissions, retry
                   -> background worker -> PostgreSQL request + attempt transaction
                   -> commit -> acknowledge/delete queue entry
 
@@ -93,7 +96,7 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Startup registry, isolated quotas/cache, rotation and disabling; dollar budgets and live administration remain |
 | Durable usage pipeline | Persistent Redis Stream, retrying PostgreSQL worker, deduplication and daily reports; pre-enqueue crash gaps remain |
-| Operations | Logs/metrics, stage timings, Windows/Linux benchmarks, Linux Compose and separate-container open-loop loads; deployment hardening, overload accounting and production soak tests remain |
+| Operations | Logs/metrics, stage timings, Windows/Linux benchmarks, Linux Compose, separate-container open-loop loads, concurrency admission and usage retries; deployment hardening, crash-safe handoffs and production soak tests remain |
 
 Tests cover concurrency, refunds, duplicate/late settlement, underestimated
 usage, missing usage, fragmented SSE, and output bounds. Settlement is currently
@@ -111,3 +114,4 @@ See [performance](performance.md) for p50/p99, benchmark modes and interpretatio
 See [Linux containers](containers.md) for the Compose topology, storage and startup.
 See [separate-container load testing](load-testing.md) for fixed-rate traffic,
 gateway CPU/memory, usage verification and observed overload limits.
+See [overload protection](overload-protection.md) for admission seats and usage retries.

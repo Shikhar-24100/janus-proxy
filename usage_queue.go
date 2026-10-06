@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,8 +22,12 @@ var errInvalidQueuedUsage = errors.New("invalid usage queue entry")
 
 // Do not trim unacknowledged events to make room. Refuse new events at capacity.
 var enqueueUsageScript = redis.NewScript(`
+local previous = redis.call('GET', KEYS[2])
+if previous then return previous end
 if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[1]) then return redis.error_reply('USAGE_QUEUE_FULL') end
-return redis.call('XADD', KEYS[1], '*', 'event', ARGV[2])
+local id = redis.call('XADD', KEYS[1], '*', 'event', ARGV[2])
+redis.call('SET', KEYS[2], id, 'PX', 30000)
+return id
 `)
 
 // One consumer group owns this stream. Delete only after successful persistence.
@@ -35,20 +40,31 @@ return acknowledged
 `)
 
 type usagePipeline struct {
-	client     *redis.Client
-	store      usageStore
-	stream     string
-	group      string
-	consumer   string
-	claimIdle  time.Duration
-	capacity   int
-	queued     atomic.Uint64
-	enqueueErr atomic.Uint64
-	persisted  atomic.Uint64
-	workerErr  atomic.Uint64
-	invalid    atomic.Uint64
-	cancel     context.CancelFunc
-	done       chan struct{}
+	client        *redis.Client
+	store         usageStore
+	stream        string
+	group         string
+	consumer      string
+	claimIdle     time.Duration
+	capacity      int
+	queued        atomic.Uint64
+	enqueueErr    atomic.Uint64
+	persisted     atomic.Uint64
+	workerErr     atomic.Uint64
+	invalid       atomic.Uint64
+	cancel        context.CancelFunc
+	done          chan struct{}
+	publisherCtx  context.Context
+	publisherDone chan struct{}
+	publisherMu   sync.Mutex
+	retries       chan usageRetry
+	pending       atomic.Int64
+	retriesTotal  atomic.Uint64
+}
+
+type usageRetry struct {
+	event   requestEvent
+	release func()
 }
 
 func newUsagePipeline(ctx context.Context, redisURL string, store usageStore) (*usagePipeline, error) {
@@ -80,6 +96,10 @@ func newUsagePipelineWithStream(ctx context.Context, redisURL string, store usag
 }
 
 func (p *usagePipeline) initialize(ctx context.Context) error {
+	if p.publisherCtx == nil {
+		p.publisherCtx, p.cancel = context.WithCancel(context.Background())
+		p.retries = make(chan usageRetry, defaultMaxInflight)
+	}
 	err := p.client.XGroupCreateMkStream(ctx, p.stream, p.group, "0").Err()
 	if err != nil && !strings.HasPrefix(err.Error(), "BUSYGROUP") {
 		return err
@@ -88,18 +108,49 @@ func (p *usagePipeline) initialize(ctx context.Context) error {
 }
 
 // The database is off the request path, but the reliable handoff is a bounded write.
-func (p *usagePipeline) publish(event requestEvent) {
+func (p *usagePipeline) publish(event requestEvent, releases ...func()) {
+	var release func()
+	if len(releases) > 0 {
+		release = releases[0]
+	}
+	complete := func() {
+		if release != nil {
+			release()
+		}
+	}
 	if event.TenantID == "" {
+		complete()
 		return // Rejected authentication has no tenant usage to account for.
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	if err := p.enqueue(ctx, event); err != nil {
+	if validateUsageEvent(event) != nil {
 		p.enqueueErr.Add(1)
-		log.Printf("Usage enqueue failed for request %s; event not confirmed in queue", event.RequestID)
+		complete()
 		return
 	}
-	p.queued.Add(1)
+	ctx, cancel := context.WithTimeout(p.publisherCtx, 200*time.Millisecond)
+	err := p.enqueue(ctx, event)
+	cancel()
+	if err == nil {
+		p.queued.Add(1)
+		complete()
+		return
+	}
+	p.retriesTotal.Add(1)
+	// Keep the event AND its admission seat until Redis confirms the handoff.
+	// The channel is sized to the gateway limit, so admitted handlers bound it.
+	p.publisherMu.Lock()
+	defer p.publisherMu.Unlock()
+	if p.publisherCtx.Err() != nil {
+		p.unconfirmed(usageRetry{event, release})
+		return
+	}
+	p.pending.Add(1)
+	select {
+	case p.retries <- usageRetry{event, release}:
+	case <-p.publisherCtx.Done():
+		p.pending.Add(-1)
+		p.unconfirmed(usageRetry{event, release})
+	}
 }
 
 func (p *usagePipeline) enqueue(ctx context.Context, event requestEvent) error {
@@ -110,12 +161,14 @@ func (p *usagePipeline) enqueue(ctx context.Context, event requestEvent) error {
 	if err != nil {
 		return err
 	}
-	return enqueueUsageScript.Run(ctx, p.client, []string{p.stream}, p.capacity, string(data)).Err()
+	return enqueueUsageScript.Run(ctx, p.client, []string{p.stream, p.stream + ":handoff:" + event.RequestID}, p.capacity, string(data)).Err()
 }
 
 func (p *usagePipeline) start() {
-	ctx, cancel := context.WithCancel(context.Background())
-	p.cancel, p.done = cancel, make(chan struct{})
+	ctx := p.publisherCtx
+	p.done = make(chan struct{})
+	p.publisherDone = make(chan struct{})
+	go func() { defer close(p.publisherDone); p.retryHandoffs(ctx) }()
 	go func() {
 		defer close(p.done)
 		p.run(ctx)
@@ -125,9 +178,72 @@ func (p *usagePipeline) start() {
 func (p *usagePipeline) close() {
 	if p.cancel != nil {
 		p.cancel()
-		<-p.done
+		if p.done != nil {
+			<-p.done
+		}
+		if p.publisherDone != nil {
+			<-p.publisherDone
+		}
 	}
 	p.client.Close()
+}
+
+func (p *usagePipeline) unconfirmed(job usageRetry) {
+	p.enqueueErr.Add(1)
+	log.Printf("Usage handoff unconfirmed at shutdown for request %s", job.event.RequestID)
+	if job.release != nil {
+		job.release()
+	}
+}
+
+func (p *usagePipeline) retryHandoffs(ctx context.Context) {
+	defer func() {
+		// Serialize draining with submissions so cancellation cannot strand a job.
+		p.publisherMu.Lock()
+		defer p.publisherMu.Unlock()
+		for {
+			select {
+			case job := <-p.retries:
+				p.pending.Add(-1)
+				p.unconfirmed(job)
+			default:
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-p.retries:
+			delay := 50 * time.Millisecond
+			for {
+				attemptCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+				err := p.enqueue(attemptCtx, job.event)
+				cancel()
+				if err == nil {
+					p.queued.Add(1)
+					p.pending.Add(-1)
+					if job.release != nil {
+						job.release()
+					}
+					break
+				}
+				if ctx.Err() != nil {
+					p.pending.Add(-1)
+					p.unconfirmed(job)
+					return
+				}
+				p.retriesTotal.Add(1)
+				if !usagePause(ctx, delay) {
+					p.pending.Add(-1)
+					p.unconfirmed(job)
+					return
+				}
+				delay = min(delay*2, time.Second)
+			}
+		}
+	}
 }
 
 func (p *usagePipeline) run(ctx context.Context) {

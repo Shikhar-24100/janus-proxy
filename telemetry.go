@@ -37,6 +37,8 @@ type requestTrace struct {
 	attempts        []attemptObservation
 	cache           string
 	cacheWriteError bool
+	overloaded      bool
+	release         func()
 }
 
 func traceFrom(r *http.Request) *requestTrace {
@@ -58,6 +60,7 @@ type requestEvent struct {
 	Attempts        []attemptObservation `json:"attempts"`
 	Cache           string               `json:"cache"`
 	CacheWriteError bool                 `json:"cache_write_error"`
+	Overloaded      bool                 `json:"-"`
 }
 
 var latencyBounds = [...]float64{0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
@@ -104,10 +107,12 @@ type telemetry struct {
 	idPrefix     string
 	breakers     map[string]*circuitBreaker
 	usage        *usagePipeline
+	admission    *admissionGate
 }
 
 func newTelemetry(writer io.Writer) *telemetry {
 	t := &telemetry{requests: make(map[requestMetric]uint64), attempts: make(map[attemptMetric]uint64), idPrefix: rand.Text(), breakers: make(map[string]*circuitBreaker)}
+	t.admission, _ = newAdmissionGate("")
 	if writer != nil {
 		t.queue, t.done = make(chan requestEvent, 256), make(chan struct{})
 		go func() {
@@ -205,7 +210,8 @@ func (t *telemetry) observe(next http.Handler) http.Handler {
 				outcome = "error"
 			}
 			event := requestEvent{TenantID: trace.tenantID, Time: time.Now().UTC(), Event: "chat_request", RequestID: id, Route: trace.route, Status: status, Outcome: outcome, Stream: trace.stream, Duration: float64(time.Since(trace.started)) / float64(time.Millisecond), TTFT: trace.ttft, Attempts: trace.attempts, Cache: trace.cache, CacheWriteError: trace.cacheWriteError}
-			t.record(event, trace.fallback)
+			event.Overloaded = trace.overloaded
+			t.recordWithRelease(event, trace.fallback, trace.release)
 			if panicked != nil {
 				panic(panicked)
 			}
@@ -215,6 +221,10 @@ func (t *telemetry) observe(next http.Handler) http.Handler {
 }
 
 func (t *telemetry) record(event requestEvent, fallback bool) {
+	t.recordWithRelease(event, fallback, nil)
+}
+
+func (t *telemetry) recordWithRelease(event requestEvent, fallback bool, release func()) {
 	status := "other"
 	if event.Status >= 100 && event.Status < 600 {
 		status = strconv.Itoa(event.Status/100) + "xx"
@@ -267,10 +277,12 @@ func (t *telemetry) record(event requestEvent, fallback bool) {
 			t.dropped.Add(1)
 		}
 	}
-	if t.usage != nil && event.TenantID != "" {
+	if t.usage != nil && event.TenantID != "" && !event.Overloaded {
 		started := time.Now()
-		t.usage.publish(event)
+		t.usage.publish(event, release)
 		t.observeStage(2, started)
+	} else if release != nil {
+		release()
 	}
 }
 
@@ -283,8 +295,10 @@ func writeHistogram(out *strings.Builder, name, help string, h latencyHistogram)
 }
 
 func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	// Seats include completed requests still waiting for usage confirmation.
 	var out strings.Builder
 	t.mu.Lock()
+	fmt.Fprintf(&out, "# HELP janus_admission_active Held concurrency seats, including pending handoffs.\n# TYPE janus_admission_active gauge\njanus_admission_active %d\n# TYPE janus_admission_limit gauge\njanus_admission_limit %d\n# TYPE janus_overload_rejections_total counter\njanus_overload_rejections_total %d\n", t.admission.active.Load(), cap(t.admission.slots), t.admission.rejected.Load())
 	fmt.Fprintln(&out, "# HELP janus_chat_requests_total Finished chat requests, including rejected calls.\n# TYPE janus_chat_requests_total counter")
 	for key, count := range t.requests {
 		fmt.Fprintf(&out, "janus_chat_requests_total{route=%q,status_class=%q,outcome=%q} %d\n", key.route, key.status, key.outcome, count)
@@ -321,8 +335,9 @@ func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	t.mu.Unlock()
 	fmt.Fprintf(&out, "# HELP janus_log_dropped_total Request logs dropped when the queue is full.\n# TYPE janus_log_dropped_total counter\njanus_log_dropped_total %d\n# HELP janus_log_write_errors_total Failed JSON log writes.\n# TYPE janus_log_write_errors_total counter\njanus_log_write_errors_total %d\n", t.dropped.Load(), t.logErrors.Load())
 	if p := t.usage; p != nil {
+		fmt.Fprintf(&out, "# HELP janus_usage_pending_handoffs Retained jobs awaiting Redis confirmation.\n# TYPE janus_usage_pending_handoffs gauge\njanus_usage_pending_handoffs %d\n# HELP janus_usage_enqueue_retries_total Failures triggering another handoff attempt.\n# TYPE janus_usage_enqueue_retries_total counter\njanus_usage_enqueue_retries_total %d\n", p.pending.Load(), p.retriesTotal.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_enqueued_total Confirmed usage queue handoffs.\n# TYPE janus_usage_enqueued_total counter\njanus_usage_enqueued_total %d\n", p.queued.Load())
-		fmt.Fprintf(&out, "# HELP janus_usage_enqueue_errors_total Usage events not confirmed in queue.\n# TYPE janus_usage_enqueue_errors_total counter\njanus_usage_enqueue_errors_total %d\n", p.enqueueErr.Load())
+		fmt.Fprintf(&out, "# HELP janus_usage_enqueue_errors_total Terminal invalid events or handoffs unconfirmed at shutdown.\n# TYPE janus_usage_enqueue_errors_total counter\njanus_usage_enqueue_errors_total %d\n", p.enqueueErr.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_persisted_total Saved and acknowledged deliveries, including deduplicated retries.\n# TYPE janus_usage_persisted_total counter\njanus_usage_persisted_total %d\n", p.persisted.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_worker_errors_total Worker read, save or acknowledgement failures.\n# TYPE janus_usage_worker_errors_total counter\njanus_usage_worker_errors_total %d\n", p.workerErr.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_invalid_events_total Invalid entries encountered, including repeat encounters.\n# TYPE janus_usage_invalid_events_total counter\njanus_usage_invalid_events_total %d\n", p.invalid.Load())

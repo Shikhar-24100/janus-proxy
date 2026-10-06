@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -49,13 +51,113 @@ func queueFixture(t *testing.T, store usageStore) *usagePipeline {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if p.cancel != nil {
-			p.cancel()
+		p.cancel()
+		if p.done != nil {
 			<-p.done
+			<-p.publisherDone
 		}
 		p.client.Del(context.Background(), p.stream)
 	})
 	return p
+}
+
+// Inject a lost reply AFTER Redis commits; retry must not append twice, even
+// if the worker has already acknowledged/deleted the first stream entry.
+type lostUsageReply struct{ injected atomic.Bool }
+
+func (h *lostUsageReply) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *lostUsageReply) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *lostUsageReply) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		args := cmd.Args()
+		if err == nil && (cmd.Name() == "eval" || cmd.Name() == "evalsha") && len(args) > 2 && args[2] == 2 && h.injected.CompareAndSwap(false, true) {
+			return context.DeadlineExceeded
+		}
+		return err
+	}
+}
+
+func TestRedisUsageLostReplyRetriesWithoutDuplicate(t *testing.T) {
+	store := &failingUsageStore{}
+	p := queueFixture(t, store)
+	hook := &lostUsageReply{}
+	p.client.AddHook(hook)
+	p.start()
+	event := sampleUsageEvent()
+	var releases atomic.Int32
+	p.publish(event, func() { releases.Add(1) })
+	waitFor(t, func() bool { return p.pending.Load() == 0 && p.persisted.Load() == 1 && releases.Load() == 1 })
+	if !hook.injected.Load() || p.retriesTotal.Load() != 1 || p.queued.Load() != 1 || p.enqueueErr.Load() != 0 || store.calls.Load() != 1 {
+		t.Fatal("lost reply was not recovered once")
+	}
+	if err := p.enqueue(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	n, err := p.client.XLen(context.Background(), p.stream).Result()
+	if err != nil || n != 0 {
+		t.Fatal("retry after acknowledgement recreated the event")
+	}
+}
+
+func TestRedisUsageShutdownReportsUnconfirmedAndReleasesSeat(t *testing.T) {
+	store := &failingUsageStore{}
+	store.fail.Store(true)
+	p := queueFixture(t, store)
+	p.capacity = 1
+	if err := p.enqueue(context.Background(), sampleUsageEvent()); err != nil {
+		t.Fatal(err)
+	}
+	p.start()
+	var releases atomic.Int32
+	p.publish(sampleUsageEvent(), func() { releases.Add(1) })
+	if p.pending.Load() != 1 {
+		t.Fatal("event was not retained")
+	}
+	p.cancel()
+	<-p.publisherDone
+	<-p.done
+	if p.pending.Load() != 0 || releases.Load() != 1 || p.enqueueErr.Load() != 1 || p.queued.Load() != 0 {
+		t.Fatal("shutdown hid an unconfirmed event or leaked a seat")
+	}
+}
+
+func TestRedisUsageBacklogClosesAdmissionAndRecovers(t *testing.T) {
+	store := &failingUsageStore{}
+	store.fail.Store(true)
+	p := queueFixture(t, store)
+	p.capacity = 1
+	if err := p.enqueue(context.Background(), sampleUsageEvent()); err != nil {
+		t.Fatal(err)
+	}
+	p.start()
+	metrics := newTelemetry(nil)
+	metrics.usage = p
+	metrics.admission, _ = newAdmissionGate("1")
+	metrics.admission.slots <- struct{}{}
+	metrics.admission.active.Add(1)
+	p.publish(sampleUsageEvent(), func() { metrics.admission.active.Add(-1); <-metrics.admission.slots })
+	if p.pending.Load() != 1 || metrics.admission.active.Load() != 1 {
+		t.Fatal("unconfirmed usage lost its seat")
+	}
+	calls := 0
+	handler := metrics.observe(metrics.admit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(200) })))
+	rejected := httptest.NewRecorder()
+	handler.ServeHTTP(rejected, httptest.NewRequest("POST", "/", nil))
+	if rejected.Code != 503 || calls != 0 {
+		t.Fatal("provider was invoked during usage recovery")
+	}
+	store.fail.Store(false)
+	waitFor(t, func() bool {
+		return p.pending.Load() == 0 && p.persisted.Load() == 2 && metrics.admission.active.Load() == 0
+	})
+	accepted := httptest.NewRecorder()
+	handler.ServeHTTP(accepted, httptest.NewRequest("POST", "/", nil))
+	if accepted.Code != 200 || calls != 1 || p.enqueueErr.Load() != 0 {
+		t.Fatal("admission did not recover")
+	}
 }
 
 func readUsageMessage(t *testing.T, p *usagePipeline) redis.XMessage {
@@ -147,11 +249,11 @@ func TestRedisUsageMalformedEntryAndEnqueueMetrics(t *testing.T) {
 	if pending, err := p.client.XPending(context.Background(), p.stream, p.group).Result(); err != nil || pending.Count != 1 {
 		t.Fatal("malformed entry silently discarded")
 	}
-	// Queue capacity errors are visible; unauthenticated logs never enter usage storage.
+	// Queue capacity errors retain the event; unauthenticated logs never enter storage.
 	p.capacity = 1
 	p.publish(sampleUsageEvent())
 	p.publish(requestEvent{})
-	if p.enqueueErr.Load() != 1 || p.queued.Load() != 0 {
+	if p.enqueueErr.Load() != 0 || p.retriesTotal.Load() != 1 || p.pending.Load() != 1 || p.queued.Load() != 0 {
 		t.Fatal("enqueue failure or unauthenticated event incorrectly accounted")
 	}
 }

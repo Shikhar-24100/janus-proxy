@@ -5,6 +5,8 @@
 !go.mod
 !go.sum
 !auth.go
+!admission.go
+!admission_test.go
 !auth_test.go
 !breaker.go
 !breaker_test.go

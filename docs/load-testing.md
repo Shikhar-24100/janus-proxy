@@ -1,5 +1,10 @@
 # Separate-container load testing
 
+The measurements below predate admission protection. The current gateway uses
+32 seats and can deliberately reject load with 503. Use `-AllowOverload` to test
+admitted-response/accounting correctness under saturation; omit it to require
+every arrival to succeed. See [the new design and measurements](overload-protection.md).
+
 Run from the repository in PowerShell with Ubuntu WSL and Docker Engine:
 
 ```powershell
@@ -119,7 +124,9 @@ detects that limit; it does not repair delivery. Mean usage enqueue was about
 1.3 ms at 200 RPS, 7.6 ms for JSON at 1000 RPS and 77.4 ms for SSE at 1000 RPS.
 Mean quota admission rose to 16.5 ms in the SSE stress phase. Investigate CPU,
 Redis waits, fsync and worker throughput; these times do not prove one cause.
-Bounded admission and handling unconfirmed handoffs are follow-up work.
+Bounded admission and retained retries now address these failure paths; see
+[the updated design and measurements](overload-protection.md). Worker throughput
+and crash-safe handoffs remain follow-up work.
 
 The sustained run used Go 1.27.1, Docker Engine 29.1.3 and Ubuntu WSL with the
 actual Alpine runtime image and the limits above. Thirty seconds per phase at

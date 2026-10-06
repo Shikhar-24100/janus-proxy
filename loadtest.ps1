@@ -1,7 +1,8 @@
 param(
     [ValidateRange(1, 300)][int]$DurationSeconds = 10,
     [ValidatePattern('^[0-9]+(,[0-9]+)*$')][string]$Rates = '50,200,500',
-    [ValidateRange(1, 4096)][int]$MaxInflight = 256
+    [ValidateRange(1, 4096)][int]$MaxInflight = 256,
+    [switch]$AllowOverload
 )
 $ErrorActionPreference = 'Stop'
 foreach ($rate in $Rates.Split(',')) {
@@ -10,6 +11,7 @@ foreach ($rate in $Rates.Split(',')) {
 $workspacePath = $PSScriptRoot.Replace('\', '/')
 $linuxPath = (& wsl.exe -d Ubuntu -u root -- wslpath -a $workspacePath).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the workspace in Ubuntu WSL.' }
-& wsl.exe -d Ubuntu -u root -- sh "$linuxPath/scripts/loadtest.sh" "$linuxPath" $DurationSeconds $Rates $MaxInflight
+$overloadMode = if ($AllowOverload) { 'true' } else { 'false' }
+& wsl.exe -d Ubuntu -u root -- sh "$linuxPath/scripts/loadtest.sh" "$linuxPath" $DurationSeconds $Rates $MaxInflight $overloadMode
 if ($LASTEXITCODE -ne 0) { throw 'Load test failed. Inspect .cache/loadtest reports.' }
 Write-Host 'Reports: .cache/loadtest/results.md, results.json, samples.csv, resources.jsonl'

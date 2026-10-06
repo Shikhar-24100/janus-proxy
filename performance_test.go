@@ -303,6 +303,7 @@ func TestGatewayPerformance(t *testing.T) {
 		defer func() {
 			pipeline.cancel()
 			<-pipeline.done
+			<-pipeline.publisherDone
 			pipeline.client.Del(context.Background(), pipeline.stream)
 			pipeline.client.Close()
 		}()
@@ -407,13 +408,13 @@ func TestGatewayPerformance(t *testing.T) {
 						t.Fatal("cannot inspect benchmark queue")
 					}
 					result.QueueAfterDrain = length
-					if length == 0 || time.Now().After(deadline) {
+					if (length == 0 && pipeline.pending.Load() == 0) || time.Now().After(deadline) {
 						break
 					}
 					time.Sleep(20 * time.Millisecond)
 				}
 				result.EnqueueErrors, result.WorkerErrors = pipeline.enqueueErr.Load(), pipeline.workerErr.Load()
-				if result.QueueAfterDrain != 0 || result.EnqueueErrors != 0 || result.WorkerErrors != 0 {
+				if result.QueueAfterDrain != 0 || pipeline.pending.Load() != 0 || result.EnqueueErrors != 0 || result.WorkerErrors != 0 {
 					t.Error("usage queue failed or did not drain")
 				}
 			}

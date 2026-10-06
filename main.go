@@ -65,6 +65,10 @@ func main() {
 		log.Fatal(err)
 	}
 	observability := newTelemetry(os.Stderr)
+	observability.admission, err = newAdmissionGate(os.Getenv("MAX_INFLIGHT"))
+	if err != nil {
+		log.Fatal(err)
+	}
 	databaseURL, queueURL := os.Getenv("DATABASE_URL"), os.Getenv("USAGE_REDIS_URL")
 	if (databaseURL == "") != (queueURL == "") {
 		log.Fatal("Set both DATABASE_URL and USAGE_REDIS_URL, or leave both empty to disable usage storage")
@@ -84,6 +88,7 @@ func main() {
 			log.Fatal(err)
 		}
 		observability.usage = pipeline
+		pipeline.retries = make(chan usageRetry, cap(observability.admission.slots))
 		pipeline.start()
 		defer pipeline.close()
 	}
@@ -126,7 +131,7 @@ func newMuxWithTelemetry(provider *Provider, janusKey string, limiter requestLim
 		cache = provider.cache
 	}
 	chat := limitRequests(limiter, http.HandlerFunc(provider.chatHandler), cache)
-	mux.Handle("POST /v1/chat/completions", observability.observe(requireAPIKey(janusKey, chat)))
+	mux.Handle("POST /v1/chat/completions", observability.observe(requireAPIKey(janusKey, observability.admit(chat))))
 	return mux
 }
 

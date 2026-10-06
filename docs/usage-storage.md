@@ -57,6 +57,9 @@ budget bounds that operation, including after client cancellation. Writing the
 response body does not guarantee net/http has already flushed or closed it, so
 this handoff can still add completion latency. Streaming text is forwarded as
 before; queue handoff happens after streaming and quota settlement.
+An unconfirmed fast-path handoff now transfers the event and its admission seat
+to a bounded retry goroutine. New admissions pause until it confirms delivery.
+The HTTP response can finish while that retained job retries.
 
 Our existing console-log channel is separate and best effort. A Go channel holds
 data in process memory and loses it on a crash; it is not the durable usage queue.
@@ -176,7 +179,9 @@ the worker saves events asynchronously: this is eventual consistency.
 Authenticated `/metrics` exposes:
 
 - `janus_usage_enqueued_total`: confirmed queue handoffs.
-- `janus_usage_enqueue_errors_total`: events whose handoff wasn't confirmed.
+- `janus_usage_enqueue_errors_total`: terminal invalid/unconfirmed events at shutdown.
+- `janus_usage_pending_handoffs`: retained usage jobs awaiting confirmation.
+- `janus_usage_enqueue_retries_total`: failures triggering another attempt.
 - `janus_usage_persisted_total`: saved/acknowledged deliveries, including duplicate retries.
 - `janus_usage_worker_errors_total`: read, save or acknowledgement failures.
 - `janus_usage_invalid_events_total`: invalid-entry encounters, including repeats.
@@ -201,9 +206,11 @@ concurrent duplicate inserts, commit-before-ack recovery and daily-report maths.
 An event is recoverable after it has been accepted by the persistent queue,
 subject to Redis/disk durability. A crash during generation or before enqueue
 can still leave a missing completion event. An enqueue timeout can be ambiguous:
-Redis might have accepted it; the failure counter records lack of confirmation.
-If handoff fails, Janus retains the original chat response and emits a diagnostic
-and metric; no local replay spool repairs that gap automatically.
+Redis might have accepted it. Janus now retains the event and its admission seat
+in a bounded retry channel, pauses new admissions and retries confirmation.
+Recent handoff markers reduce duplicate Redis deliveries; PostgreSQL request IDs
+prevent duplicate accounting. The retained job is not crash durable until Redis
+confirms it. See [overload and retry design](overload-protection.md).
 
 Gateway shutdown stops admission, allows up to five seconds for active handlers,
 then cancels remaining work. The worker stops without deleting unfinished events;
