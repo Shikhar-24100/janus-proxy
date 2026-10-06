@@ -25,6 +25,7 @@ type attemptObservation struct {
 }
 
 type requestTrace struct {
+	metrics         *telemetry
 	tenantID        string
 	started         time.Time
 	route           string
@@ -59,7 +60,7 @@ type requestEvent struct {
 	CacheWriteError bool                 `json:"cache_write_error"`
 }
 
-var latencyBounds = [...]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
+var latencyBounds = [...]float64{0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
 
 type latencyHistogram struct {
 	buckets [len(latencyBounds)]uint64
@@ -93,6 +94,7 @@ type telemetry struct {
 	inflight     int64
 	duration     latencyHistogram
 	ttft         latencyHistogram
+	stages       [len(stageNames)]latencyHistogram
 	queue        chan requestEvent
 	done         chan struct{}
 	closeOnce    sync.Once
@@ -168,7 +170,7 @@ func (w *flushingObservedWriter) Flush() {
 
 func (t *telemetry) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		trace := &requestTrace{started: time.Now(), route: "none", cache: "BYPASS", attempts: make([]attemptObservation, 0, 2)}
+		trace := &requestTrace{metrics: t, started: time.Now(), route: "none", cache: "BYPASS", attempts: make([]attemptObservation, 0, 2)}
 		id := t.idPrefix + "-" + strconv.FormatUint(t.sequence.Add(1), 16)
 		w.Header().Set("X-Request-ID", id)
 		captured := &observedWriter{ResponseWriter: w}
@@ -265,8 +267,10 @@ func (t *telemetry) record(event requestEvent, fallback bool) {
 			t.dropped.Add(1)
 		}
 	}
-	if t.usage != nil {
+	if t.usage != nil && event.TenantID != "" {
+		started := time.Now()
 		t.usage.publish(event)
+		t.observeStage(2, started)
 	}
 }
 
@@ -311,6 +315,9 @@ func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&out, "# HELP janus_fallback_selections_total Requests selecting the fallback route.\n# TYPE janus_fallback_selections_total counter\njanus_fallback_selections_total %d\n# HELP janus_chat_inflight Current chat handlers.\n# TYPE janus_chat_inflight gauge\njanus_chat_inflight %d\n", t.fallbacks, t.inflight)
 	writeHistogram(&out, "janus_request_duration_seconds", "Handler duration including quota settlement and client writes.", t.duration)
 	writeHistogram(&out, "janus_ttft_seconds", "Time from handler entry to flushing the first recognized text delta.", t.ttft)
+	for index, stage := range stageNames {
+		writeHistogram(&out, "janus_"+stage+"_duration_seconds", "Operation duration including connection acquisition and failures.", t.stages[index])
+	}
 	t.mu.Unlock()
 	fmt.Fprintf(&out, "# HELP janus_log_dropped_total Request logs dropped when the queue is full.\n# TYPE janus_log_dropped_total counter\njanus_log_dropped_total %d\n# HELP janus_log_write_errors_total Failed JSON log writes.\n# TYPE janus_log_write_errors_total counter\njanus_log_write_errors_total %d\n", t.dropped.Load(), t.logErrors.Load())
 	if p := t.usage; p != nil {

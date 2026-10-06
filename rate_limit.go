@@ -82,6 +82,11 @@ func limitRequests(limiter requestLimiter, next http.Handler, caches ...*respons
 		cache = caches[0]
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Keep the request-local wrapper in accounting so fallback/settlement are timed too.
+		limiter := limiter
+		if trace := traceFrom(r); trace != nil {
+			limiter = timedLimiter{requestLimiter: limiter, metrics: trace.metrics}
+		}
 		setCacheResult(w, r, "BYPASS")
 		input, ok := decodeChatRequest(w, r, limiter.OutputLimit())
 		if !ok {

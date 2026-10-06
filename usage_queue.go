@@ -27,8 +27,10 @@ return redis.call('XADD', KEYS[1], '*', 'event', ARGV[2])
 
 // One consumer group owns this stream. Delete only after successful persistence.
 var acknowledgeUsageScript = redis.NewScript(`
-local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
-redis.call('XDEL', KEYS[1], ARGV[2])
+local ids = {}
+for i=2,#ARGV do ids[#ids+1] = ARGV[i] end
+local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], unpack(ids))
+redis.call('XDEL', KEYS[1], unpack(ids))
 return acknowledged
 `)
 
@@ -66,8 +68,9 @@ func newUsagePipelineWithStream(ctx context.Context, redisURL string, store usag
 	options.ReadTimeout = 2 * time.Second
 	options.WriteTimeout = 300 * time.Millisecond
 	options.PoolTimeout = 200 * time.Millisecond
-	options.PoolSize = 4
-	options.MaxActiveConns = 4
+	// Bounded concurrency without serializing sixteen publishers behind four sockets.
+	options.PoolSize = 16
+	options.MaxActiveConns = 16
 	p := &usagePipeline{client: redis.NewClient(options), store: store, stream: stream, group: usageGroup, consumer: rand.Text(), claimIdle: 30 * time.Second, capacity: maxUsageQueue}
 	if err := p.initialize(ctx); err != nil {
 		p.client.Close()
@@ -162,13 +165,20 @@ func (p *usagePipeline) run(ctx context.Context) {
 			continue
 		}
 		backoff = time.Second
-		for _, message := range messages {
+		batches := [][]redis.XMessage{messages}
+		if _, ok := p.store.(batchUsageStore); !ok {
+			batches = nil
+			for _, message := range messages {
+				batches = append(batches, []redis.XMessage{message})
+			}
+		}
+		for _, batch := range batches {
 			if ctx.Err() != nil {
 				return
 			}
 			delay := time.Second
 			for {
-				err := p.process(ctx, message)
+				err := p.processBatch(ctx, batch)
 				if ctx.Err() != nil {
 					return
 				}
@@ -190,25 +200,50 @@ func (p *usagePipeline) run(ctx context.Context) {
 }
 
 func (p *usagePipeline) process(ctx context.Context, message redis.XMessage) error {
-	data, ok := message.Values["event"].(string)
-	event, err := decodeUsageEvent(data)
-	if !ok || err != nil {
-		// Leave malformed entries pending for inspection; never silently discard them.
-		p.invalid.Add(1)
+	return p.processBatch(ctx, []redis.XMessage{message})
+}
+
+func (p *usagePipeline) processBatch(ctx context.Context, messages []redis.XMessage) error {
+	events := make([]requestEvent, 0, len(messages))
+	args := []any{p.group}
+	for _, message := range messages {
+		data, ok := message.Values["event"].(string)
+		event, err := decodeUsageEvent(data)
+		if !ok || err != nil {
+			// Retain poison entries; valid neighbors can still commit.
+			p.invalid.Add(1)
+			if len(messages) > 1 {
+				p.workerErr.Add(1)
+			}
+			continue
+		}
+		events = append(events, event)
+		args = append(args, message.ID)
+	}
+	if len(events) == 0 {
 		return errInvalidQueuedUsage
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err = p.store.Save(writeCtx, event)
+	var err error
+	if store, ok := p.store.(batchUsageStore); ok {
+		err = store.SaveBatch(writeCtx, events)
+	} else {
+		for _, event := range events {
+			if err = p.store.Save(writeCtx, event); err != nil {
+				break
+			}
+		}
+	}
 	cancel()
 	if err != nil {
 		return err
 	}
 	ackCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	if err := acknowledgeUsageScript.Run(ackCtx, p.client, []string{p.stream}, p.group, message.ID).Err(); err != nil {
+	if err := acknowledgeUsageScript.Run(ackCtx, p.client, []string{p.stream}, args...).Err(); err != nil {
 		return err
 	}
-	p.persisted.Add(1)
+	p.persisted.Add(uint64(len(events)))
 	return nil
 }
 

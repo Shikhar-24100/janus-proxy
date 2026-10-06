@@ -29,10 +29,11 @@ existing Redis instances alone and keeps WSL active for localhost forwarding.
 Stopping or restarting this development Redis loses its quota state. For another
 Redis deployment, configure `REDIS_URL` instead of using this script.
 
-If Windows reports low memory or an insufficient paging file while compiling,
-use `$env:GOMAXPROCS = '1'` before running the local startup script. For checks,
-use `go test -p 1 ./...` and `go vet -p 1 ./...` to reduce build concurrency.
-This is a local development workaround, not a production performance setting.
+The startup script already limits build concurrency with `-p 1`. For checks,
+use `go test -p 1 ./...` and `go vet -p 1 ./...` if Windows has little memory.
+An earlier workaround set `$env:GOMAXPROCS = '1'`; that also limits the running
+gateway. Remove it with `Remove-Item Env:GOMAXPROCS -ErrorAction SilentlyContinue`
+to use Go's runtime default, or set it deliberately for CPU comparisons.
 
 For local Groq setup, copy `.env.example` to `.env`, set your provider key and
 your separate `JANUS_API_KEY` there, and run in a second terminal:
@@ -442,6 +443,11 @@ p50/p99, throughput, failures and usage backlog. It uses real Redis/PostgreSQL
 with isolated benchmark state and makes no billed provider calls.
 Use `-Mode core` to measure HTTP/auth/routing/SSE without those services;
 core results do not validate full gateway overhead. Reports are in `.cache/perf`.
+The benchmark defaults to two Go CPUs; use `-GoCPUs 1`, `2`, or `4` to compare
+runtime configurations. Reports also include means for quota admission,
+settlement and durable enqueue. The worker now commits available events in
+batches of up to 16 before acknowledging them, and upstream HTTP clients retain
+idle connections after concurrent bursts.
 See [percentiles, benchmark scenarios and interpretation](docs/performance.md).
 
 ## Check

@@ -33,10 +33,16 @@ mode, 500 measured requests per scenario, concurrency 1 and 16. Counts must be
 100-5000; concurrency 1-128. Failed service startup is not silently replaced
 with a core benchmark.
 
+`-GoCPUs` defaults to 2 and explicitly sets GOMAXPROCS only for the run, restoring
+the previous value afterward. Compare `-GoCPUs 1`, `2`, and `4` independently of
+build concurrency (`-p 1`). More CPUs do not guarantee lower latency.
+
 Results are written to ignored `.cache/perf/latest-core.*` or `latest-full.*`:
 
 - Markdown: readable summary table.
 - JSON: summary, UTC measurement timestamp, Go version, OS and GOMAXPROCS.
+- Stage operation means: admission, settlement and durable usage enqueue,
+  including connection acquisition and failures, excluding warm-ups.
 - CSV: every sample's duration, first-text time and error.
 
 Do not publish raw conclusions without the mode and concurrency. Core results
@@ -67,8 +73,10 @@ when enabled. Every JSON body is checked, and SSE must include text and DONE.
 Warm-up requests are excluded (20 or the concurrency level, whichever is larger).
 Successful measurements determine percentiles; all failures are counted and
 make the run fail. Throughput is completed successful requests per wall-clock
-second. HTTP connection reuse uses the usual two-idle-connections-per-host
-default, including the gateway's upstream client.
+second. The load generator retains two idle connections per host across all
+comparisons. Janus now retains up to 64 idle connections per provider host and
+128 overall per provider transport, reducing redialing after concurrent bursts.
+These are idle limits, not limits on active requests.
 
 ## Interpreting results correctly
 
@@ -115,6 +123,86 @@ Profiled runs write `latest-core-profiled.*` (or full), preserving the unprofile
 report and explicitly marking profiler overhead. Avoid compiling tests or running
 other load generators during a latency measurement.
 A future separate-process load generator can measure gateway CPU/RSS independently.
+
+## October 6 optimization pass
+
+Stage measurements at concurrency 16 and GOMAXPROCS=2 showed durable enqueue
+averaging 21.42 ms for JSON, compared with 1.90 ms admission and 1.87 ms
+settlement. Changes target that waiting and repeated connection/allocation work:
+
+- The durable Redis pool is bounded at 16 connections, previously four.
+- The worker saves up to 16 available events in one PostgreSQL transaction using
+  pgx batching, then acknowledges/deletes them in one Redis script. It never
+  acknowledges before commit or waits to fill a batch. PostgreSQL still has at
+  most two connections and there is still one worker.
+- Provider transports retain 64 idle connections per host, previously two.
+- Streaming copy buffers use a sync.Pool; each buffer is cleared before return,
+  including aborted streams. Go can discard unused pooled buffers during GC.
+- Fixed stage histograms expose admission, settlement and enqueue in `/metrics`.
+  The benchmark reports operation means; they do not add up to an end-to-end
+  percentile. Provider attempts remain timed separately in logs.
+
+Quota admission remains atomic and reconciliation idempotent. Usage Redis still
+uses appendfsync=always. The reliable handoff still runs on handler completion;
+its cost has not been hidden by moving events into an in-memory queue.
+
+Pre-change two-CPU runs had full JSON p50 34.35-38.42 ms and p99 63.15-80.91 ms
+at concurrency 16. Two post-change runs before buffer reuse had JSON p50
+22.74-25.56 ms and p99 40.40-54.33 ms. Enqueue mean fell to 6.66-7.71 ms.
+Full SSE TTFT p50 changed from 12.53-14.10 ms to 7.50-8.63 ms.
+The worker still accumulated backlog: JSON had 103-149 entries immediately after
+load, down from 475-480; all drained. Cache bursts retained larger backlogs.
+
+Results are not uniformly better: quota-only JSON p50 was 17.32 ms in the
+instrumented baseline and 19.45-20.16 ms afterward, and cache-hit p99 was
+34.41 ms before versus 52.70-61.84 ms afterward in these two-CPU runs. Cache
+tail latency and quota/WSL variability need further investigation. Fixed
+concurrency also changes achieved arrival rate when the gateway speeds up.
+
+A four-CPU post-change run had full JSON p50/p99 25.46/45.69 ms and SSE TTFT
+p50/p99 6.05/12.35 ms. More CPUs did not consistently improve every scenario;
+the benchmark defaults to two rather than assuming the largest value wins.
+All these runs used 500 measured requests per scenario and had zero request,
+enqueue and worker errors. Before/after changes were measured as a group;
+these results do not isolate each individual change's contribution.
+
+The final unprofiled run, including buffer reuse, measured 7000 requests at
+GOMAXPROCS=2, concurrency 1 and 16, with zero request/enqueue/worker failures
+and all queues drained. Concurrent full JSON p50 improved about 24% against
+the instrumented two-CPU baseline; the slow tail remains variable.
+
+| Final measurement | Concurrency 1 | Concurrency 16 |
+| --- | ---: | ---: |
+| Direct JSON p50 / p99 ms | 11.29 / 12.28 | 11.66 / 22.40 |
+| Full Janus JSON p50 / p99 ms | 18.13 / 95.45 | 29.37 / 50.60 |
+| Direct SSE TTFT p50 / p99 ms | 4.30 / 5.56 | 4.12 / 15.19 |
+| Full Janus SSE TTFT p50 / p99 ms | 5.74 / 8.75 | 11.24 / 35.73 |
+| Durable enqueue mean ms, JSON | 4.75 | 9.53 |
+| Full JSON backlog after load | 1 | 228 |
+
+The final single-client JSON p99 spiked to 95.45 ms versus 24.96 ms in the first
+optimized run. Its cause was not established. Do not present only the favorable
+runs: local Windows/WSL timing and durable disk-write tails still need study.
+The median JSON difference from direct is approximately 6.85 ms at concurrency
+1 and 17.71 ms at concurrency 16. This does not establish the full 5-10 ms goal.
+
+Sampled whole-harness allocation profiles for the same 500-request, concurrency
+16 scenarios fell from about 138 MB to 105 MB after buffer reuse. Stream copying
+was the largest allocation source before reuse and disappeared from the top
+allocation sources afterward. These are sampled allocated bytes across the
+whole run, not peak RAM or isolated gateway memory; profiled timings are excluded
+from the comparison above.
+
+Tests verify failed batches remain pending, poison entries survive while valid
+neighbors commit, duplicate deliveries preserve request/attempt totals, and a
+SQL error rolls back the entire transaction. Existing streaming/cancellation,
+tenant, fallback and quota integration tests pass, as does go vet.
+
+Next measurements should run the gateway and load generator separately, place
+Janus and Redis in the same Linux environment, inspect Redis pool waits and
+disk latency, and use longer controlled arrival-rate loads. Cache p99 and worker
+drain throughput remain important targets; lowering durability to win the
+benchmark is not part of this pass.
 
 ## WSL startup history
 

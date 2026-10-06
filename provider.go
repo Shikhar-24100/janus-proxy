@@ -38,12 +38,17 @@ func newProvider(baseURL, apiKey string) (*Provider, error) {
 		return nil, errors.New("OPENAI_BASE_URL must use HTTPS, except for local development")
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/chat/completions"
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Retain connections after concurrent bursts instead of repeatedly dialing/TLS.
+	transport.MaxIdleConns = 128
+	transport.MaxIdleConnsPerHost = 64
 	return &Provider{
 		endpoint: u.String(),
 		apiKey:   strings.TrimSpace(apiKey),
 		breaker:  newCircuitBreaker(),
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			Transport: transport,
+			Timeout:   60 * time.Second,
 			// Do not follow redirects with provider credentials.
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse

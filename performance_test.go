@@ -46,20 +46,27 @@ type perfSample struct {
 }
 
 type perfSummary struct {
-	Scenario                        string   `json:"scenario"`
-	Concurrency                     int      `json:"concurrency"`
-	Requests                        int      `json:"requests"`
-	Errors                          int      `json:"errors"`
-	P50MS                           float64  `json:"p50_ms"`
-	P99MS                           float64  `json:"p99_ms"`
-	TTFTP50MS                       *float64 `json:"ttft_p50_ms,omitempty"`
-	TTFTP99MS                       *float64 `json:"ttft_p99_ms,omitempty"`
-	RequestsPerSecond               float64  `json:"requests_per_second"`
-	HarnessAllocatedBytesPerRequest uint64   `json:"harness_allocated_bytes_per_request"`
-	QueueAfterLoad                  int64    `json:"queue_after_load"`
-	QueueAfterDrain                 int64    `json:"queue_after_drain"`
-	EnqueueErrors                   uint64   `json:"enqueue_errors"`
-	WorkerErrors                    uint64   `json:"worker_errors"`
+	Scenario                        string             `json:"scenario"`
+	Concurrency                     int                `json:"concurrency"`
+	Requests                        int                `json:"requests"`
+	Errors                          int                `json:"errors"`
+	P50MS                           float64            `json:"p50_ms"`
+	P99MS                           float64            `json:"p99_ms"`
+	TTFTP50MS                       *float64           `json:"ttft_p50_ms,omitempty"`
+	TTFTP99MS                       *float64           `json:"ttft_p99_ms,omitempty"`
+	RequestsPerSecond               float64            `json:"requests_per_second"`
+	HarnessAllocatedBytesPerRequest uint64             `json:"harness_allocated_bytes_per_request"`
+	QueueAfterLoad                  int64              `json:"queue_after_load"`
+	QueueAfterDrain                 int64              `json:"queue_after_drain"`
+	EnqueueErrors                   uint64             `json:"enqueue_errors"`
+	WorkerErrors                    uint64             `json:"worker_errors"`
+	StageMeanMS                     map[string]float64 `json:"stage_mean_ms"`
+}
+
+func perfStages(obs *telemetry) [len(stageNames)]latencyHistogram {
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	return obs.stages
 }
 
 func perfPercentile(values []time.Duration, percentile float64) float64 {
@@ -313,8 +320,9 @@ func TestGatewayPerformance(t *testing.T) {
 	defer obs.close()
 	defer gateway.Close()
 	var fullGateway *httptest.Server
+	var fullObs *telemetry
 	if pipeline != nil {
-		fullObs := newTelemetry(io.Discard)
+		fullObs = newTelemetry(io.Discard)
 		fullObs.usage = pipeline
 		fullGateway = httptest.NewServer(newTenantMux(provider, "perf-admin-key", registry, fullObs))
 		defer fullObs.close()
@@ -334,7 +342,7 @@ func TestGatewayPerformance(t *testing.T) {
 	for _, level := range levels {
 		for _, scenario := range scenarios {
 			transport := http.DefaultTransport.(*http.Transport).Clone()
-			transport.MaxIdleConnsPerHost = 2 // Same idle-pool default as the upstream client.
+			transport.MaxIdleConnsPerHost = 2 // Hold the load generator constant across comparisons.
 			client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
 			if scenario.cache { // Prime without requiring the first request to be a hit.
 				r := httptest.NewRequest("POST", "/", strings.NewReader(`{"model":"fake-model","messages":[{"role":"user","content":"hello"}],"stream":false,"max_completion_tokens":64}`))
@@ -350,11 +358,26 @@ func TestGatewayPerformance(t *testing.T) {
 				}
 			}
 			var before, after runtime.MemStats
+			stageObs := obs
+			if scenario.usage {
+				stageObs = fullObs
+			}
+			stageBefore := perfStages(stageObs)
 			runtime.ReadMemStats(&before)
 			samples, elapsed := perfLoad(client, scenario.url, scenario.stream, scenario.cache, count, level)
 			runtime.ReadMemStats(&after)
 			client.CloseIdleConnections()
 			result := perfSummary{Scenario: scenario.name, Concurrency: level, Requests: count, HarnessAllocatedBytesPerRequest: (after.TotalAlloc - before.TotalAlloc) / uint64(count)}
+			stageAfter := perfStages(stageObs)
+			result.StageMeanMS = make(map[string]float64)
+			if !strings.HasPrefix(scenario.name, "direct-") {
+				for index, name := range stageNames {
+					calls := stageAfter[index].count - stageBefore[index].count
+					if calls > 0 {
+						result.StageMeanMS[name] = (stageAfter[index].sum - stageBefore[index].sum) * 1000 / float64(calls)
+					}
+				}
+			}
 			var durations, ttfts []time.Duration
 			for index, sample := range samples {
 				errorText := ""
@@ -399,6 +422,7 @@ func TestGatewayPerformance(t *testing.T) {
 			}
 			summaries = append(summaries, result)
 			t.Logf("%s c=%d: p50 %.2f ms, p99 %.2f ms, errors %d", scenario.name, level, result.P50MS, result.P99MS, result.Errors)
+			t.Logf("stage operation means (ms): %v", result.StageMeanMS)
 		}
 	}
 	writePerfReport(t, mode, summaries, csvRows)
@@ -457,6 +481,21 @@ func writePerfReport(t *testing.T, mode string, results []perfSummary, rows [][]
 		fmt.Fprintf(&markdown, "| %s | %d | %d | %d | %.2f | %.2f | %s | %s | %.1f |\n", result.Scenario, result.Concurrency, result.Requests, result.Errors, result.P50MS, result.P99MS, tt50, tt99, result.RequestsPerSecond)
 	}
 	markdown.WriteString("\nCompare direct and Janus distributions at the same concurrency. Differences between p99s are not the p99 of per-request overhead. Repeat runs; a few hundred samples give a noisy tail. Harness allocation figures in JSON include client, fake provider, gateway and worker in one process, not isolated Janus RSS/CPU. Optional CPU/heap profiles add profiling overhead. Full mode uses its own Redis stream, quota/cache namespace and temporary tenant rows, cleaned after the run.\n")
+	markdown.WriteString("\n## Stage operation means\n\nIncludes connection acquisition and failed operations; excludes warm-up. Counts are operations (fallback/cache misses can reserve again), not necessarily requests. These means do not sum to end-to-end p50.\n\n| Scenario | Concurrency | Admission mean ms | Settlement mean ms | Enqueue mean ms |\n|---|---:|---:|---:|---:|\n")
+	for _, result := range results {
+		if len(result.StageMeanMS) == 0 {
+			continue
+		}
+		fmt.Fprintf(&markdown, "| %s | %d", result.Scenario, result.Concurrency)
+		for _, stage := range stageNames {
+			if value, ok := result.StageMeanMS[stage]; ok {
+				fmt.Fprintf(&markdown, " | %.2f", value)
+			} else {
+				markdown.WriteString(" | -")
+			}
+		}
+		markdown.WriteString(" |\n")
+	}
 	if err := os.WriteFile(base+".md", []byte(markdown.String()), 0644); err != nil {
 		t.Fatal(err)
 	}

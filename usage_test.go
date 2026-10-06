@@ -283,3 +283,100 @@ func TestUsageEventValidation(t *testing.T) {
 		t.Fatal("oversized queue payload accepted")
 	}
 }
+
+type failingBatchStore struct {
+	failingUsageStore
+	batchCalls atomic.Int32
+}
+
+func (store *failingBatchStore) SaveBatch(ctx context.Context, events []requestEvent) error {
+	store.batchCalls.Add(1)
+	if store.fail.Load() {
+		return errors.New("database unavailable")
+	}
+	for _, event := range events {
+		if err := store.Save(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestRedisUsageBatchFailureAndPoisonNeighbor(t *testing.T) {
+	store := &failingBatchStore{}
+	p := queueFixture(t, store)
+	for range 3 {
+		if err := p.enqueue(context.Background(), sampleUsageEvent()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.client.XAdd(context.Background(), &redis.XAddArgs{Stream: p.stream, Values: map[string]any{"event": "invalid"}})
+	streams, err := p.client.XReadGroup(context.Background(), &redis.XReadGroupArgs{Group: p.group, Consumer: p.consumer, Streams: []string{p.stream, ">"}, Count: 16, Block: -1}).Result()
+	if err != nil || len(streams) != 1 || len(streams[0].Messages) != 4 {
+		t.Fatal("cannot read test batch")
+	}
+	messages := streams[0].Messages
+	store.fail.Store(true)
+	if err := p.processBatch(context.Background(), messages); err == nil {
+		t.Fatal("failed batch acknowledged")
+	}
+	pending, err := p.client.XPending(context.Background(), p.stream, p.group).Result()
+	if err != nil || pending.Count != 4 || p.persisted.Load() != 0 {
+		t.Fatal("failed batch lost pending entries")
+	}
+	store.fail.Store(false)
+	if err := p.processBatch(context.Background(), messages); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = p.client.XPending(context.Background(), p.stream, p.group).Result()
+	length := p.client.XLen(context.Background(), p.stream).Val()
+	if err != nil || pending.Count != 1 || length != 1 || p.persisted.Load() != 3 || store.batchCalls.Load() != 2 {
+		t.Fatal("batch recovery lost valid entries or discarded poison entry")
+	}
+}
+
+func TestPostgresUsageBatchReplayAndValidation(t *testing.T) {
+	store := postgresFixture(t)
+	first := sampleUsageEvent()
+	cleanupUsageRows(t, store, first.TenantID)
+	second := first
+	second.RequestID, second.Route, second.Cache, second.Attempts = rand.Text(), "cache", "HIT", nil
+	third := first
+	third.RequestID = rand.Text()
+	third.Attempts = []attemptObservation{{Route: "primary", Outcome: "failure", Status: 503, Duration: 1}, first.Attempts[0]}
+	third.Attempts[1].Route = "fallback"
+	events := []requestEvent{first, second, third, first}
+	for range 2 {
+		if err := store.SaveBatch(context.Background(), events); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var requests, attempts, unknown int
+	if err := store.pool.QueryRow(context.Background(), `SELECT count(*) FROM janus_usage_requests WHERE tenant_id=$1`, first.TenantID).Scan(&requests); err != nil || requests != 3 {
+		t.Fatal("batch replay duplicated or lost requests")
+	}
+	if err := store.pool.QueryRow(context.Background(), `SELECT count(*), count(*) FILTER (WHERE total_tokens IS NULL) FROM janus_usage_attempts WHERE request_id IN ($1,$2,$3)`, first.RequestID, second.RequestID, third.RequestID).Scan(&attempts, &unknown); err != nil || attempts != 3 || unknown != 1 {
+		t.Fatal("batch replay changed attempts or unknown usage")
+	}
+	valid := first
+	valid.RequestID = rand.Text()
+	invalid := valid
+	invalid.Event = "invalid"
+	if err := store.SaveBatch(context.Background(), []requestEvent{valid, invalid}); err == nil {
+		t.Fatal("invalid batch accepted")
+	}
+	if err := store.pool.QueryRow(context.Background(), `SELECT count(*) FROM janus_usage_requests WHERE request_id=$1`, valid.RequestID).Scan(&requests); err != nil || requests != 0 {
+		t.Fatal("invalid batch partially saved")
+	}
+	// Go accepts this date, but PostgreSQL timestamps cannot represent it. A SQL
+	// failure after the first insert must roll back the entire transaction.
+	outsideRange := valid
+	outsideRange.RequestID = rand.Text()
+	outsideRange.Time = time.Date(-10000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.SaveBatch(context.Background(), []requestEvent{valid, outsideRange}); err == nil {
+		t.Fatal("out-of-range PostgreSQL timestamp unexpectedly saved")
+	}
+	if err := store.pool.QueryRow(context.Background(), `SELECT count(*) FROM janus_usage_requests WHERE request_id IN ($1,$2)`, valid.RequestID, outsideRange.RequestID).Scan(&requests); err != nil || requests != 0 {
+		t.Fatal("database failure did not roll back the whole batch")
+	}
+}

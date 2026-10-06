@@ -8,6 +8,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -16,6 +17,10 @@ var usageSchema string
 
 type usageStore interface {
 	Save(context.Context, requestEvent) error
+}
+
+type batchUsageStore interface {
+	SaveBatch(context.Context, []requestEvent) error
 }
 
 type postgresUsageStore struct{ pool *pgxpool.Pool }
@@ -40,8 +45,45 @@ func newPostgresUsageStore(ctx context.Context, url string) (*postgresUsageStore
 }
 
 func (store *postgresUsageStore) Save(ctx context.Context, event requestEvent) error {
-	if err := validateUsageEvent(event); err != nil {
-		return err
+	return store.SaveBatch(ctx, []requestEvent{event})
+}
+
+// Insert attempts only for newly inserted requests; replay never doubles usage.
+const insertUsageSQL = `WITH inserted AS (
+	INSERT INTO janus_usage_requests
+	(request_id, tenant_id, finished_at, route, status, outcome, streaming, cache_result, duration_ms, ttft_ms)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+	ON CONFLICT (request_id) DO NOTHING RETURNING request_id
+)
+INSERT INTO janus_usage_attempts
+	(request_id, attempt_index, route, outcome, upstream_status, duration_ms, prompt_tokens, completion_tokens, total_tokens)
+SELECT inserted.request_id, (a.ordinality-1)::integer,
+	a.value->>'route', a.value->>'outcome', (a.value->>'upstream_status')::integer,
+	(a.value->>'duration_ms')::double precision,
+	(a.value->'usage'->>'prompt_tokens')::bigint,
+	(a.value->'usage'->>'completion_tokens')::bigint,
+	(a.value->'usage'->>'total_tokens')::bigint
+FROM inserted CROSS JOIN jsonb_array_elements($11::jsonb) WITH ORDINALITY AS a(value, ordinality)`
+
+func (store *postgresUsageStore) SaveBatch(ctx context.Context, events []requestEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, event := range events {
+		if err := validateUsageEvent(event); err != nil {
+			return err
+		}
+		attempts := event.Attempts
+		if attempts == nil {
+			attempts = []attemptObservation{}
+		}
+		data, err := json.Marshal(attempts)
+		if err != nil {
+			return err
+		}
+		batch.Queue(insertUsageSQL, event.RequestID, event.TenantID, event.Time, event.Route,
+			event.Status, event.Outcome, event.Stream, event.Cache, event.Duration, event.TTFT, string(data))
 	}
 	tx, err := store.pool.Begin(ctx)
 	if err != nil {
@@ -52,28 +94,10 @@ func (store *postgresUsageStore) Save(ctx context.Context, event requestEvent) e
 		defer cancel()
 		_ = tx.Rollback(rollbackCtx)
 	}()
-	result, err := tx.Exec(ctx, `INSERT INTO janus_usage_requests
-		(request_id, tenant_id, finished_at, route, status, outcome, streaming, cache_result, duration_ms, ttft_ms)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (request_id) DO NOTHING`,
-		event.RequestID, event.TenantID, event.Time, event.Route, event.Status, event.Outcome, event.Stream, event.Cache, event.Duration, event.TTFT)
-	if err != nil {
+	// pgx sends the batch together; close results before committing the transaction.
+	results := tx.SendBatch(ctx, batch)
+	if err := results.Close(); err != nil {
 		return err
-	}
-	if result.RowsAffected() == 0 {
-		// A previous delivery committed the entire request and its attempts.
-		return tx.Commit(ctx)
-	}
-	for index, attempt := range event.Attempts {
-		var prompt, completion, total *int64
-		if attempt.Usage != nil {
-			prompt, completion, total = attempt.Usage.Prompt, attempt.Usage.Completion, attempt.Usage.Total
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO janus_usage_attempts
-			(request_id, attempt_index, route, outcome, upstream_status, duration_ms, prompt_tokens, completion_tokens, total_tokens)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, event.RequestID, index, attempt.Route, attempt.Outcome, attempt.Status, attempt.Duration, prompt, completion, total)
-		if err != nil {
-			return err
-		}
 	}
 	return tx.Commit(ctx)
 }

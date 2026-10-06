@@ -56,6 +56,12 @@ func TestTelemetryFallbackUsageAndPrivacy(t *testing.T) {
 		t.Fatal("lost usage from an attempt")
 	}
 	metrics := metricText(t, mux)
+	// Primary and fallback each reserve/reconcile; metrics must include both attempts.
+	for _, required := range []string{"janus_quota_admission_duration_seconds_count 2", "janus_quota_settlement_duration_seconds_count 2", "janus_usage_enqueue_duration_seconds_count 0"} {
+		if !strings.Contains(metrics, required) {
+			t.Fatalf("missing stage metric %s", required)
+		}
+	}
 	for _, required := range []string{`janus_reported_tokens_total{route="primary",kind="total"} 50`, `janus_reported_tokens_total{route="fallback",kind="total"} 7`, `janus_fallback_selections_total 1`, `janus_request_duration_seconds_count 1`, `janus_chat_inflight 0`, `janus_ttft_seconds_count 0`} {
 		if !strings.Contains(metrics, required) {
 			t.Fatalf("missing metric %s", required)

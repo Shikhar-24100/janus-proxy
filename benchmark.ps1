@@ -2,7 +2,8 @@ param(
     [ValidateSet('core', 'full')][string]$Mode = 'full',
     [ValidateRange(100, 5000)][int]$Requests = 500,
     [int[]]$Concurrency = @(1, 16),
-    [switch]$Profile
+    [switch]$Profile,
+    [ValidateRange(1, 128)][int]$GoCPUs = 2
 )
 $ErrorActionPreference = 'Stop'
 foreach ($level in $Concurrency) {
@@ -29,11 +30,12 @@ if ($Mode -eq 'full') {
 }
 $goPath = Join-Path $PSScriptRoot '.tools\go\bin\go.exe'
 if (-not (Test-Path -LiteralPath $goPath)) { $goPath = (Get-Command go).Source }
-$variableNames = @('JANUS_PERF','JANUS_PERF_MODE','JANUS_PERF_REQUESTS','JANUS_PERF_CONCURRENCY','JANUS_PERF_REDIS_URL','JANUS_PERF_USAGE_REDIS_URL','JANUS_PERF_DATABASE_URL','JANUS_PERF_PROFILE','GOCACHE','GOMODCACHE')
+$variableNames = @('JANUS_PERF','JANUS_PERF_MODE','JANUS_PERF_REQUESTS','JANUS_PERF_CONCURRENCY','JANUS_PERF_REDIS_URL','JANUS_PERF_USAGE_REDIS_URL','JANUS_PERF_DATABASE_URL','JANUS_PERF_PROFILE','GOCACHE','GOMODCACHE','GOMAXPROCS')
 $previous = @{}
 foreach ($name in $variableNames) { $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 Push-Location $PSScriptRoot
 try {
+	$env:GOMAXPROCS = [string]$GoCPUs
     $env:JANUS_PERF = '1'
     $env:JANUS_PERF_MODE = $Mode
     $env:JANUS_PERF_REQUESTS = [string]$Requests
@@ -49,7 +51,7 @@ try {
         $null = New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot '.cache\perf')
         $arguments += @('-cpuprofile', ".cache/perf/$Mode-cpu.pprof", '-memprofile', ".cache/perf/$Mode-heap.pprof", '-o', ".cache/perf/$Mode.test.exe")
     }
-    Write-Host "Local fake provider benchmark: $Mode mode, $Requests requests per scenario, concurrency $($Concurrency -join ',')."
+    Write-Host "Local fake provider benchmark: $Mode mode, $Requests requests per scenario, concurrency $($Concurrency -join ','), Go CPUs $GoCPUs."
     & $goPath @arguments .
     if ($LASTEXITCODE -ne 0) { throw 'Benchmark failed; inspect its errors above.' }
     $reportName = "latest-$Mode"

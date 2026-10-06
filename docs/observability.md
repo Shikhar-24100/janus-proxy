@@ -29,6 +29,7 @@ GET /metrics + Janus key -> read metrics and breaker snapshots
 | Circuit state gauge | Closed=0, open=1, half-open=2 for each configured route |
 | Logging counters | Events dropped due to a full queue, or failed log writes |
 | Cache counters | Hit/miss/bypass/error results and separate read/write errors |
+| Stage histograms | Quota admission, quota settlement and durable usage enqueue, including connection acquisition and failures |
 
 For total token usage, select `kind="total"`. That already includes prompt and
 completion tokens; summing all three kinds would double-count usage.
@@ -46,6 +47,17 @@ direct provider calls is still needed to assess the 5-10 ms overhead goal.
 Provider attempt durations are present in request logs.
 Duration is captured before optional durable usage enqueue, so its bounded
 handoff latency is not included in that measurement.
+
+The three stage families are `janus_quota_admission_duration_seconds`,
+`janus_quota_settlement_duration_seconds`, and
+`janus_usage_enqueue_duration_seconds`. Each exposes `_bucket`, `_sum`, and
+`_count`. For example, enqueue `_sum / _count * 1000` gives its mean operation
+duration in milliseconds. Admission includes extra cache-miss/fallback token
+reservations; counts are operations, not necessarily one per request. Enqueue
+counts only tenant-attributed requests when usage storage is enabled. Settlement
+does not run when provider usage is unknown. Cache, HTTP and provider generation
+contribute additional time outside these three stages. Sub-millisecond buckets
+make fast local operations visible.
 
 ## Counters, gauges, and histograms
 

@@ -5,8 +5,11 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"sync"
 	"time"
 )
+
+var streamBuffers = sync.Pool{New: func() any { return new([32 * 1024]byte) }}
 
 func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, response *http.Response, outcome *breakerOutcome) {
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
@@ -32,7 +35,13 @@ func (p *Provider) forwardStream(w http.ResponseWriter, r *http.Request, respons
 
 	// A network read can contain part of an SSE event or several events.
 	// Forward the bytes unchanged; the client assembles complete events.
-	buffer := make([]byte, 32*1024)
+	storage := streamBuffers.Get().(*[32 * 1024]byte)
+	defer func() {
+		// Return on completion, cancellation or abort; erase the previous answer.
+		clear(storage[:])
+		streamBuffers.Put(storage)
+	}()
+	buffer := storage[:]
 	observer := usageObserver{}
 	for {
 		n, readErr := response.Body.Read(buffer)

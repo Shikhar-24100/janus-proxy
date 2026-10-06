@@ -61,7 +61,12 @@ before; queue handoff happens after streaming and quota settlement.
 Our existing console-log channel is separate and best effort. A Go channel holds
 data in process memory and loses it on a crash; it is not the durable usage queue.
 The worker uses at most two PostgreSQL connections, one worker per Janus process,
-and batches of at most 16 queued messages (each database save is one transaction).
+and batches of at most 16 queued messages. Available messages are sent together
+through pgx in one PostgreSQL transaction; the worker does not wait to fill a batch.
+After commit, one Redis script acknowledges and removes all valid entries in that
+batch. Failed batches stay pending and replay safely; malformed neighbors stay
+pending while valid entries can proceed. Usage Redis has a bounded pool of 16
+connections shared by publishers and the worker, replacing the earlier four.
 
 ## Delivery, retry and duplicates
 
