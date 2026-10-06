@@ -1,6 +1,6 @@
 # Separate-container load testing
 
-The measurements below predate admission protection. The current gateway uses
+The measurements below predate admission protection and the durable outbox. The current gateway uses
 32 seats and can deliberately reject load with 503. Use `-AllowOverload` to test
 admitted-response/accounting correctness under saturation; omit it to require
 every arrival to succeed. See [the new design and measurements](overload-protection.md).

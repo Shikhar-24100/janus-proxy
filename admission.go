@@ -50,8 +50,27 @@ func (t *telemetry) admit(next http.Handler) http.Handler {
 			return
 		}
 		gate.active.Add(1)
+		var releaseStorage func()
+		if t.usage != nil && t.usage.outbox != nil {
+			var ok bool
+			releaseStorage, ok = t.usage.outbox.reserve()
+			if !ok {
+				gate.active.Add(-1)
+				<-gate.slots
+				reject()
+				return
+			}
+		}
 		var once sync.Once
-		release := func() { once.Do(func() { gate.active.Add(-1); <-gate.slots }) }
+		release := func() {
+			once.Do(func() {
+				if releaseStorage != nil {
+					releaseStorage()
+				}
+				gate.active.Add(-1)
+				<-gate.slots
+			})
+		}
 		if trace := traceFrom(r); trace != nil {
 			// The outer observer releases after usage confirmation, including retries.
 			trace.release = release

@@ -350,7 +350,7 @@ func settled(c *http.Client, queue *redis.Client) (map[string]float64, int64, er
 		if err != nil {
 			return nil, 0, err
 		}
-		if m["janus_chat_inflight"] == 0 && m["janus_admission_active"] == 0 && m["janus_usage_pending_handoffs"] == 0 && n == 0 && m["janus_usage_persisted_total"] >= m["janus_usage_enqueued_total"] {
+		if m["janus_chat_inflight"] == 0 && m["janus_admission_active"] == 0 && m["janus_usage_pending_handoffs"] == 0 && m["janus_outbox_records"] == 0 && n == 0 && m["janus_usage_persisted_total"] >= m["janus_usage_enqueued_total"] {
 			return m, n, nil
 		}
 		if time.Now().After(deadline) {
@@ -513,7 +513,7 @@ func run() error {
 				failed = true
 				p.ValidationErrors = append(p.ValidationErrors, "no admitted responses or overload counter mismatch")
 			}
-			for _, key := range []string{"janus_usage_enqueue_errors_total", "janus_usage_worker_errors_total", "janus_usage_invalid_events_total"} {
+			for _, key := range []string{"janus_usage_enqueue_errors_total", "janus_usage_worker_errors_total", "janus_usage_invalid_events_total", "janus_outbox_errors_total"} {
 				if after[key] > before[key] {
 					failed = true
 					fmt.Printf("%s increased\n", key)

@@ -50,18 +50,22 @@ Provider attempt durations are present in request logs.
 Duration is captured before optional durable usage enqueue, so its bounded
 handoff latency is not included in that measurement.
 
-The three stage families are `janus_quota_admission_duration_seconds`,
-`janus_quota_settlement_duration_seconds`, and
-`janus_usage_enqueue_duration_seconds`. Each exposes `_bucket`, `_sum`, and
+The stage families are `janus_quota_admission_duration_seconds`,
+`janus_quota_settlement_duration_seconds`,
+`janus_usage_enqueue_duration_seconds`, and
+`janus_outbox_write_duration_seconds`. Each exposes `_bucket`, `_sum`, and
 `_count`. For example, enqueue `_sum / _count * 1000` gives its mean operation
 duration in milliseconds. Admission includes extra cache-miss/fallback token
 reservations; counts are operations, not necessarily one per request. Enqueue
 counts only tenant-attributed requests when usage storage is enabled.
 Overload rejections do not enqueue usage. This histogram measures the initial
 handoff/retention step; background retry time is visible through pending jobs,
-not added to the same histogram. See [admission and retry design](overload-protection.md).
+not added to the same histogram. With the durable outbox enabled, the initial
+handoff also includes local persistence and deletion. The outbox write stage
+separately observes local writes/flushes, including retries. See
+[admission and retry design](overload-protection.md) and [outbox metrics](durable-outbox.md).
 Settlement does not run when provider usage is unknown. Cache, HTTP and provider generation
-contribute additional time outside these three stages. Sub-millisecond buckets
+contribute additional time outside these stages. Sub-millisecond buckets
 make fast local operations visible.
 
 ## Counters, gauges, and histograms

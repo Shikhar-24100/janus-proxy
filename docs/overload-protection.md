@@ -73,12 +73,13 @@ new requests get 503. Already admitted requests can finish and retain their
 events too. Their seats remain held until confirmation, bounding retained
 events by admitted work. There is no unbounded memory spool.
 
-**A retained event is still in memory until Redis confirms it.** A hard process
-crash or shutdown before confirmation can still lose it. Shutdown cancels the
-retry loop, reports every remaining unconfirmed job, and releases its seat.
-Events already in persistent Redis remain recoverable by the existing worker.
-A durable local outbox/request-start journal and crash recovery are future work.
-This improves overload recovery; it is not lossless billing.
+With the Linux [durable outbox](durable-outbox.md) enabled, an event is flushed
+locally before Redis delivery and unfinished files replay after restart. Without
+it, retained events remain in memory until Redis confirms them. A crash before
+local confirmation, including during generation, can still leave missing usage.
+Shutdown cancels retries and reports unconfirmed jobs; confirmed files remain
+recoverable. A request-start journal and invoice reconciliation remain future
+work. This is not lossless billing.
 
 ## Metrics and configuration
 

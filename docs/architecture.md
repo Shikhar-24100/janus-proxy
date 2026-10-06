@@ -48,7 +48,9 @@ Handler completion -> settle actual usage in Redis
   | unknown usage -> keep reservation until original window expires
   v
 Update metrics -> enqueue JSON request log -> background console writer
+               -> Linux: fsync completion event into persistent local outbox
                -> bounded persistent Redis usage enqueue (separate 6381 server)
+                  -> confirmed: remove local outbox record; restart replays unfinished records
                   -> unconfirmed: retain event/seat, pause admissions, retry
                   -> background worker -> PostgreSQL request + attempt transaction
                   -> commit -> acknowledge/delete queue entry
@@ -95,8 +97,8 @@ production-readiness claim. Optional semantic caching is outside this scope.
 | Exact caching | Opt-in non-streaming primary answers; Redis TTL and metrics |
 | Provider resilience | Separate breakers and one fallback; load balancing still needed |
 | Tenant management | Startup registry, isolated quotas/cache, rotation and disabling; dollar budgets and live administration remain |
-| Durable usage pipeline | Persistent Redis Stream, retrying PostgreSQL worker, deduplication and daily reports; pre-enqueue crash gaps remain |
-| Operations | Logs/metrics, stage timings, Windows/Linux benchmarks, Linux Compose, separate-container open-loop loads, concurrency admission and usage retries; deployment hardening, crash-safe handoffs and production soak tests remain |
+| Durable usage pipeline | Persistent completion outbox on Linux, Redis Stream, retrying PostgreSQL worker, deduplication and daily reports; crashes before local confirmation remain uncovered |
+| Operations | Logs/metrics, stage timings, Windows/Linux benchmarks, Linux Compose, separate-container open-loop loads, concurrency admission, usage retries and completion recovery; deployment hardening, request-start journaling and production soak tests remain |
 
 Tests cover concurrency, refunds, duplicate/late settlement, underestimated
 usage, missing usage, fragmented SSE, and output bounds. Settlement is currently
@@ -115,3 +117,4 @@ See [Linux containers](containers.md) for the Compose topology, storage and star
 See [separate-container load testing](load-testing.md) for fixed-rate traffic,
 gateway CPU/memory, usage verification and observed overload limits.
 See [overload protection](overload-protection.md) for admission seats and usage retries.
+See [durable outbox](durable-outbox.md) for disk persistence and restart recovery.

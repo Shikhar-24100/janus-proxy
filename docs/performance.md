@@ -11,6 +11,11 @@ put more than the stated percentage at or below a percentile.
 
 ## Run it
 
+The older same-process `core`/`full` harness leaves the local outbox disabled,
+including its Linux variant. To measure the current Linux stack with durable
+outbox writes, use `loadtest.ps1` and the [separate-container fixture](load-testing.md).
+Current disk-write measurements are in [the outbox notes](durable-outbox.md).
+
 The benchmark starts its own HTTP fake provider and Janus servers on random
 loopback ports. It never calls Groq/OpenAI or reads provider API keys, and does
 not use the normally running Janus on 8080.

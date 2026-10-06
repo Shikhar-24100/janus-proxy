@@ -203,14 +203,16 @@ concurrent duplicate inserts, commit-before-ack recovery and daily-report maths.
 
 ## Remaining reliability limits
 
-An event is recoverable after it has been accepted by the persistent queue,
-subject to Redis/disk durability. A crash during generation or before enqueue
-can still leave a missing completion event. An enqueue timeout can be ambiguous:
+With the Linux outbox enabled, an event is recoverable after local file and
+directory confirmation, before persistent Redis accepts it. Without the outbox,
+recovery begins at persistent Redis acceptance. A crash during generation or
+before local confirmation can still leave a missing completion event. An enqueue timeout can be ambiguous:
 Redis might have accepted it. Janus now retains the event and its admission seat
 in a bounded retry channel, pauses new admissions and retries confirmation.
 Recent handoff markers reduce duplicate Redis deliveries; PostgreSQL request IDs
-prevent duplicate accounting. The retained job is not crash durable until Redis
-confirms it. See [overload and retry design](overload-protection.md).
+prevent duplicate accounting. Confirmed outbox files replay on restart; other
+retained jobs are not crash durable. See [outbox recovery](durable-outbox.md)
+and [overload and retry design](overload-protection.md).
 
 Gateway shutdown stops admission, allows up to five seconds for active handlers,
 then cancels remaining work. The worker stops without deleting unfinished events;
@@ -219,8 +221,9 @@ the next run reclaims them. A hard process kill can interrupt the handoff.
 This improves persistence and retries but is not lossless billing. Backups,
 replication, disk failure handling, backlog alerts, dead-letter administration,
 retention, durable request-start records and provider invoice reconciliation
-remain future work. Local AOF durability trades latency for safety; measured
-gateway overhead still needs a benchmark.
+remain future work. Local AOF and outbox durability trade latency for safety;
+see [the measured outbox cost](durable-outbox.md). The proxy-overhead target
+remains unfinished.
 
 References: [PostgreSQL INSERT and ON CONFLICT](https://www.postgresql.org/docs/16/sql-insert.html),
 [Redis consumer groups](https://redis.io/docs/latest/develop/use-cases/streaming/),

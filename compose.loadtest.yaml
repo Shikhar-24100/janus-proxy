@@ -34,10 +34,12 @@ services:
       TPM_LIMIT: "100000000"
       MAX_OUTPUT_TOKENS: "64"
       MAX_INFLIGHT: "32"
+      USAGE_OUTBOX_DIR: /var/lib/janus/outbox
+      USAGE_OUTBOX_MAX_MB: "32"
       SSL_CERT_FILE: /certs/cert.pem
       GOMAXPROCS: "2"
       GOMEMLIMIT: 192MiB
-    volumes: ["certs:/certs:ro"]
+    volumes: ["certs:/certs:ro", "outbox:/var/lib/janus/outbox"]
     cpus: 2
     mem_limit: 256m
     depends_on:
@@ -85,6 +87,7 @@ services:
 networks:
   default: {internal: true}
 volumes:
+  outbox:
   certs:
   usage:
   database:

@@ -335,6 +335,14 @@ func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	t.mu.Unlock()
 	fmt.Fprintf(&out, "# HELP janus_log_dropped_total Request logs dropped when the queue is full.\n# TYPE janus_log_dropped_total counter\njanus_log_dropped_total %d\n# HELP janus_log_write_errors_total Failed JSON log writes.\n# TYPE janus_log_write_errors_total counter\njanus_log_write_errors_total %d\n", t.dropped.Load(), t.logErrors.Load())
 	if p := t.usage; p != nil {
+		if o := p.outbox; o != nil {
+			records, bytes, reserved, capacity, blocked := o.snapshot()
+			blockedValue := 0
+			if blocked {
+				blockedValue = 1
+			}
+			fmt.Fprintf(&out, "# TYPE janus_outbox_records gauge\njanus_outbox_records %d\n# TYPE janus_outbox_bytes gauge\njanus_outbox_bytes %d\n# TYPE janus_outbox_reserved gauge\njanus_outbox_reserved %d\n# TYPE janus_outbox_capacity_bytes gauge\njanus_outbox_capacity_bytes %d\n# TYPE janus_outbox_blocked gauge\njanus_outbox_blocked %d\n# TYPE janus_outbox_writes_total counter\njanus_outbox_writes_total %d\n# TYPE janus_outbox_errors_total counter\njanus_outbox_errors_total %d\n# TYPE janus_outbox_replayed_total counter\njanus_outbox_replayed_total %d\n", records, bytes, reserved, capacity, blockedValue, o.writes.Load(), o.errors.Load(), o.replayed.Load())
+		}
 		fmt.Fprintf(&out, "# HELP janus_usage_pending_handoffs Retained jobs awaiting Redis confirmation.\n# TYPE janus_usage_pending_handoffs gauge\njanus_usage_pending_handoffs %d\n# HELP janus_usage_enqueue_retries_total Failures triggering another handoff attempt.\n# TYPE janus_usage_enqueue_retries_total counter\njanus_usage_enqueue_retries_total %d\n", p.pending.Load(), p.retriesTotal.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_enqueued_total Confirmed usage queue handoffs.\n# TYPE janus_usage_enqueued_total counter\njanus_usage_enqueued_total %d\n", p.queued.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_enqueue_errors_total Terminal invalid events or handoffs unconfirmed at shutdown.\n# TYPE janus_usage_enqueue_errors_total counter\njanus_usage_enqueue_errors_total %d\n", p.enqueueErr.Load())

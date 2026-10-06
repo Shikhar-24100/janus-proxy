@@ -57,9 +57,13 @@ type usagePipeline struct {
 	publisherCtx  context.Context
 	publisherDone chan struct{}
 	publisherMu   sync.Mutex
+	publishWG     sync.WaitGroup
+	closing       bool
 	retries       chan usageRetry
 	pending       atomic.Int64
 	retriesTotal  atomic.Uint64
+	outbox        *usageOutbox
+	metrics       *telemetry
 }
 
 type usageRetry struct {
@@ -127,9 +131,16 @@ func (p *usagePipeline) publish(event requestEvent, releases ...func()) {
 		complete()
 		return
 	}
-	ctx, cancel := context.WithTimeout(p.publisherCtx, 200*time.Millisecond)
-	err := p.enqueue(ctx, event)
-	cancel()
+	p.publisherMu.Lock()
+	if p.closing {
+		p.publisherMu.Unlock()
+		p.unconfirmed(usageRetry{event, release})
+		return
+	}
+	p.publishWG.Add(1)
+	p.publisherMu.Unlock()
+	defer p.publishWG.Done()
+	err := p.handoff(p.publisherCtx, event)
 	if err == nil {
 		p.queued.Add(1)
 		complete()
@@ -153,6 +164,30 @@ func (p *usagePipeline) publish(event requestEvent, releases ...func()) {
 	}
 }
 
+// A confirmed local write precedes Redis. Local deletion follows Redis confirmation.
+func (p *usagePipeline) handoff(ctx context.Context, event requestEvent) error {
+	if p.outbox != nil {
+		started := time.Now()
+		err := p.outbox.put(event)
+		p.metrics.observeStage(3, started)
+		if err != nil {
+			return err
+		}
+	}
+	// File sync cannot be interrupted by a context. Start Redis's budget only
+	// after local persistence, rather than spending it waiting on disk locks.
+	redisCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	err := p.enqueue(redisCtx, event)
+	cancel()
+	if err != nil {
+		return err
+	}
+	if p.outbox != nil {
+		return p.outbox.remove(event.RequestID)
+	}
+	return nil
+}
+
 func (p *usagePipeline) enqueue(ctx context.Context, event requestEvent) error {
 	if err := validateUsageEvent(event); err != nil {
 		return err
@@ -166,6 +201,9 @@ func (p *usagePipeline) enqueue(ctx context.Context, event requestEvent) error {
 
 func (p *usagePipeline) start() {
 	ctx := p.publisherCtx
+	if p.outbox != nil {
+		p.pending.Add(int64(len(p.outbox.recovered)))
+	}
 	p.done = make(chan struct{})
 	p.publisherDone = make(chan struct{})
 	go func() { defer close(p.publisherDone); p.retryHandoffs(ctx) }()
@@ -176,8 +214,15 @@ func (p *usagePipeline) start() {
 }
 
 func (p *usagePipeline) close() {
+	p.publisherMu.Lock()
+	p.closing = true
 	if p.cancel != nil {
 		p.cancel()
+	}
+	p.publisherMu.Unlock()
+	// Keep exclusive ownership until all file writes already started have ended.
+	p.publishWG.Wait()
+	if p.cancel != nil {
 		if p.done != nil {
 			<-p.done
 		}
@@ -186,11 +231,14 @@ func (p *usagePipeline) close() {
 		}
 	}
 	p.client.Close()
+	if p.outbox != nil {
+		p.outbox.close()
+	}
 }
 
 func (p *usagePipeline) unconfirmed(job usageRetry) {
 	p.enqueueErr.Add(1)
-	log.Printf("Usage handoff unconfirmed at shutdown for request %s", job.event.RequestID)
+	log.Printf("Usage handoff unconfirmed at shutdown for request %s; inspect outbox for recoverable events", job.event.RequestID)
 	if job.release != nil {
 		job.release()
 	}
@@ -211,38 +259,54 @@ func (p *usagePipeline) retryHandoffs(ctx context.Context) {
 			}
 		}
 	}()
+	// Recovery runs before arrivals are admitted. It does not acquire new seats.
+	if p.outbox != nil {
+		for index, event := range p.outbox.recovered {
+			p.outbox.replayed.Add(1)
+			if !p.retryHandoff(ctx, usageRetry{event: event}) {
+				// Remaining records stay on disk; no per-event memory queue to drain.
+				p.pending.Add(-int64(len(p.outbox.recovered) - index - 1))
+				return
+			}
+		}
+		p.outbox.recovered = nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case job := <-p.retries:
-			delay := 50 * time.Millisecond
-			for {
-				attemptCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-				err := p.enqueue(attemptCtx, job.event)
-				cancel()
-				if err == nil {
-					p.queued.Add(1)
-					p.pending.Add(-1)
-					if job.release != nil {
-						job.release()
-					}
-					break
-				}
-				if ctx.Err() != nil {
-					p.pending.Add(-1)
-					p.unconfirmed(job)
-					return
-				}
-				p.retriesTotal.Add(1)
-				if !usagePause(ctx, delay) {
-					p.pending.Add(-1)
-					p.unconfirmed(job)
-					return
-				}
-				delay = min(delay*2, time.Second)
+			if !p.retryHandoff(ctx, job) {
+				return
 			}
 		}
+	}
+}
+
+func (p *usagePipeline) retryHandoff(ctx context.Context, job usageRetry) bool {
+	delay := 50 * time.Millisecond
+	for {
+		err := p.handoff(ctx, job.event)
+		if err == nil {
+			p.queued.Add(1)
+			p.pending.Add(-1)
+			if job.release != nil {
+				job.release()
+			}
+			return true
+		}
+		if ctx.Err() != nil {
+			p.pending.Add(-1)
+			p.unconfirmed(job)
+			return false
+		}
+		p.retriesTotal.Add(1)
+		if !usagePause(ctx, delay) {
+			p.pending.Add(-1)
+			p.unconfirmed(job)
+			return false
+		}
+		delay = min(delay*2, time.Second)
 	}
 }
 

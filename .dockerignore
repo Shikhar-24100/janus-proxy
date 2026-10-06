@@ -37,6 +37,10 @@
 !usage_queue.go
 !usage_store.go
 !usage_test.go
+!outbox.go
+!outbox_linux.go
+!outbox_other.go
+!outbox_test.go
 !migrations/
 !migrations/**
 !queries/
@@ -51,6 +55,7 @@
 .tools/
 .git/
 .container/
+.janus-outbox/
 output/
 tmp/
 .env*

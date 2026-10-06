@@ -25,6 +25,7 @@ ENTRYPOINT ["/app/loadtest"]
 
 FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ca-certificates && addgroup -g 10001 janus && adduser -D -H -u 10001 -G janus janus
+RUN mkdir -p /var/lib/janus/outbox && chown -R 10001:10001 /var/lib/janus
 WORKDIR /app
 COPY --from=binary /out/janus /app/janus
 USER 10001:10001

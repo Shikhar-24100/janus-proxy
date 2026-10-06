@@ -27,7 +27,10 @@ Docker published port -> Janus container, port 8080
         |
         +-> quota-redis:6379 -> tenant RPM/TPM + exact cache
         |
-        +-> usage-redis:6379 -> durable stream -> Go worker inside Janus
+        +-> outbox-data volume -> fsync completion event
+        |                    |
+        +-> usage-redis:6379 <- confirmed delivery; delete local event
+                               durable stream -> Go worker inside Janus
                                                     |
                                                     v
                                                postgres:5432
@@ -38,6 +41,10 @@ the Windows/WSL boundary when the client runs on Windows.
 ```
 
 ## Files and their responsibilities
+
+Janus mounts the persistent `outbox-data` volume at `/var/lib/janus/outbox`.
+Container recreation preserves confirmed local handoffs waiting for Redis.
+The [outbox notes](durable-outbox.md) explain recovery and storage limits.
 
 | File | What it does |
 | --- | --- |

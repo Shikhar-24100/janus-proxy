@@ -12,10 +12,13 @@ services:
       USAGE_REDIS_URL: redis://usage-redis:6379/0
       DATABASE_URL: postgres://janus:${POSTGRES_PASSWORD:?Run containers.ps1 -Action init first}@postgres:5432/janus?sslmode=disable
       TENANTS_CONFIG: /app/config/tenants.json
+      USAGE_OUTBOX_DIR: /var/lib/janus/outbox
+      USAGE_OUTBOX_MAX_MB: "32"
     ports:
       - "127.0.0.1:${JANUS_HTTP_PORT:-8081}:8080"
     volumes:
       - ./.container/tenants.json:/app/config/tenants.json:ro
+      - outbox-data:/var/lib/janus/outbox
     read_only: true
     tmpfs:
       - /tmp
@@ -98,5 +101,6 @@ services:
     command: [go, test, -p, "1", -count=1, ./...]
 
 volumes:
+  outbox-data:
   usage-data:
   postgres-data:

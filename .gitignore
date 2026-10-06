@@ -9,6 +9,7 @@
 !.env.example
 tenants.local.json
 .container/
+.janus-outbox/
 
 # Machine-specific editor settings.
 .vscode/settings.json

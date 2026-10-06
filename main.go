@@ -73,6 +73,9 @@ func main() {
 	if (databaseURL == "") != (queueURL == "") {
 		log.Fatal("Set both DATABASE_URL and USAGE_REDIS_URL, or leave both empty to disable usage storage")
 	}
+	if os.Getenv("USAGE_OUTBOX_DIR") != "" && databaseURL == "" {
+		log.Fatal("USAGE_OUTBOX_DIR requires DATABASE_URL and USAGE_REDIS_URL")
+	}
 	if databaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		store, err := newPostgresUsageStore(ctx, databaseURL)
@@ -88,6 +91,14 @@ func main() {
 			log.Fatal(err)
 		}
 		observability.usage = pipeline
+		pipeline.metrics = observability
+		if path := os.Getenv("USAGE_OUTBOX_DIR"); path != "" {
+			pipeline.outbox, err = openUsageOutbox(path, os.Getenv("USAGE_OUTBOX_MAX_MB"))
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Printf("Durable usage outbox enabled; %d events waiting for recovery", len(pipeline.outbox.recovered))
+		}
 		pipeline.retries = make(chan usageRetry, cap(observability.admission.slots))
 		pipeline.start()
 		defer pipeline.close()
@@ -117,7 +128,7 @@ func main() {
 	}
 	stop()
 	<-shutdownDone
-	// Accepted usage events remain in Redis even if the worker stops before draining.
+	// Confirmed local outbox and Redis records remain recoverable after shutdown.
 }
 
 func newMux(provider *Provider, janusKey string, limiter requestLimiter) *http.ServeMux {

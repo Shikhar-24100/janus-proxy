@@ -8,7 +8,7 @@ if (Test-Path -LiteralPath $configPath) {
         if ($line -eq '' -or $line.StartsWith('#')) { continue }
         $parts = $line.Split('=', 2)
         $settingName = $parts[0].Trim()
-        if ($parts.Length -ne 2 -or ($settingName -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY', 'JANUS_API_KEY', 'LISTEN_ADDR', 'MAX_INFLIGHT', 'REDIS_URL', 'RPM_LIMIT', 'TPM_LIMIT', 'MAX_OUTPUT_TOKENS', 'FALLBACK_API_KEY', 'FALLBACK_BASE_URL', 'FALLBACK_MODEL', 'CACHE_TTL_SECONDS', 'TENANTS_CONFIG', 'DATABASE_URL', 'USAGE_REDIS_URL') -and $settingName -cnotmatch '^[A-Z][A-Z0-9_]*_JANUS_API_KEY$')) {
+        if ($parts.Length -ne 2 -or ($settingName -notin @('OPENAI_BASE_URL', 'OPENAI_API_KEY', 'JANUS_API_KEY', 'LISTEN_ADDR', 'MAX_INFLIGHT', 'REDIS_URL', 'RPM_LIMIT', 'TPM_LIMIT', 'MAX_OUTPUT_TOKENS', 'FALLBACK_API_KEY', 'FALLBACK_BASE_URL', 'FALLBACK_MODEL', 'CACHE_TTL_SECONDS', 'TENANTS_CONFIG', 'DATABASE_URL', 'USAGE_REDIS_URL', 'USAGE_OUTBOX_DIR', 'USAGE_OUTBOX_MAX_MB') -and $settingName -cnotmatch '^[A-Z][A-Z0-9_]*_JANUS_API_KEY$')) {
             throw 'The .env file contains an unsupported setting or invalid NAME=value format.'
         }
         [Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim(), 'Process')

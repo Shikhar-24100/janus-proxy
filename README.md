@@ -430,6 +430,10 @@ See [observability notes and examples](docs/observability.md).
 
 ## Durable usage storage
 
+The Linux Compose stack also enables a persistent local completion outbox.
+Completed events are flushed locally before Redis delivery, and unfinished
+handoffs replay on restart. See [outbox design and recovery boundaries](docs/durable-outbox.md).
+
 Set both `DATABASE_URL` and `USAGE_REDIS_URL` to enable storage, or leave both
 empty to disable it. Our local setup uses PostgreSQL in WSL on 5432 and a separate
 persistent Redis on 6381. Start `.\start-usage.ps1` in another terminal before
@@ -445,6 +449,9 @@ Enqueue failures are visible in logs/metrics and can leave accounting gaps;
 crashes before enqueue are not covered. See [worker design, setup and limitations](docs/usage-storage.md).
 
 ## Local performance benchmark
+
+This same-process harness leaves the local outbox disabled. Use `loadtest.ps1`
+to measure the Linux gateway with outbox durability enabled.
 
 `.\benchmark.ps1 -Mode full -Requests 500 -Concurrency 1,16` compares a local fake
 provider with Janus, measuring JSON latency, streaming first-text latency,
