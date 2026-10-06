@@ -116,11 +116,35 @@ report and explicitly marking profiler overhead. Avoid compiling tests or runnin
 other load generators during a latency measurement.
 A future separate-process load generator can measure gateway CPU/RSS independently.
 
-## Current environment limitation
+## WSL startup history
 
 On the October 6, 2026 session, Ubuntu WSL could not start with
 `Wsl/Service/E_UNEXPECTED`. No distributions were running; a subsystem reset did
 not resolve it, and this session could not restart the Windows WSL service.
-Full-mode measurements remain unverified until those dependencies are restored.
-Core-mode artifacts are labeled accordingly. Re-run full mode after WSL works;
+Ubuntu started successfully on a later retry during the October 6 startup
+repair session. PostgreSQL and both Redis instances were restored, and Janus
+health, metrics and saved usage history were verified. The earlier Windows
+failure's root cause was not established. See [startup checks](startup.md).
+Core-mode artifacts remain labeled separately from full measurements;
 do not interpret the core baseline as having met the full latency target.
+
+The restored full-mode run completed 7000 measured requests (500 per scenario,
+concurrency 1 and 16), with no request, enqueue or worker failures and empty
+queues after draining. Windows Go used GOMAXPROCS=1, the local fake provider,
+WSL Redis and PostgreSQL, and appendfsync=always for usage Redis.
+
+| JSON path | Concurrency | p50 ms | p99 ms |
+| --- | ---: | ---: | ---: |
+| Direct | 1 | 11.34 | 13.08 |
+| Janus with Redis, usage disabled | 1 | 15.85 | 19.67 |
+| Janus with durable usage | 1 | 22.62 | 30.59 |
+| Direct | 16 | 14.49 | 24.32 |
+| Janus with Redis, usage disabled | 16 | 49.79 | 88.89 |
+| Janus with durable usage | 16 | 56.17 | 173.93 |
+
+These results show substantial additional latency in this local setup, especially
+under concurrency. They do not establish the desired 5-10 ms overhead target.
+Investigate Redis/WSL round trips, connection contention, gateway scheduling and
+durable enqueue cost before choosing optimizations; this run alone does not
+identify the exact bottleneck. Streaming TTFT, cache-hit results and raw samples
+are in ignored `.cache/perf/latest-full.{md,json,csv}`.

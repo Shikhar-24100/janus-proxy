@@ -12,6 +12,10 @@ an upstream that is failing.
 
 ## Run
 
+See [startup checks and WSL troubleshooting](docs/startup.md) if a local service
+fails to start. The scripts distinguish WSL startup failure from Linux service
+failures and reuse already responding project Redis instances.
+
 Requires Go 1.24 or newer and Redis. Our local Go installation already meets this.
 For this Windows setup, Ubuntu WSL already has Redis installed. First open a
 terminal and keep it running:

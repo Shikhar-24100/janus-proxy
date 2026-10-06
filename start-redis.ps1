@@ -1,4 +1,12 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'check-wsl.ps1')
+Assert-JanusWsl
+
+wsl.exe -d Ubuntu -- bash -lc 'redis-cli -p 6380 ping >/dev/null 2>&1'
+if ($LASTEXITCODE -eq 0) {
+    Write-Host 'Quota/cache Redis is already responding on localhost:6380. Keep its original terminal open.'
+    return
+}
 
 # Keep Redis in the foreground so WSL and its localhost forwarding stay active.
 # Use a dedicated development port, leaving any existing Redis on 6379 alone.
