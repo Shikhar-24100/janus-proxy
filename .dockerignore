@@ -38,6 +38,8 @@
 !usage_store.go
 !usage_test.go
 !outbox.go
+!outbox_journal.go
+!outbox_journal_test.go
 !outbox_linux.go
 !outbox_other.go
 !outbox_test.go

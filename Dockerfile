@@ -12,10 +12,11 @@ FROM build AS test
 RUN go test -p 1 ./...
 
 FROM build AS binary
-RUN CGO_ENABLED=0 go build -p 1 -trimpath -ldflags="-s -w" -o /out/janus .
+# Keep compiler caches out of image layers; these temporary mounts use build-time RAM.
+RUN --mount=type=tmpfs,target=/root/.cache/go-build,size=1073741824 --mount=type=tmpfs,target=/tmp,size=536870912 CGO_ENABLED=0 go build -p 1 -trimpath -ldflags="-s -w" -o /out/janus .
 
 FROM build AS load-binary
-RUN CGO_ENABLED=0 go build -p 1 -trimpath -o /out/loadtest ./cmd/loadtest
+RUN --mount=type=tmpfs,target=/root/.cache/go-build,size=1073741824 --mount=type=tmpfs,target=/tmp,size=536870912 CGO_ENABLED=0 go build -p 1 -trimpath -o /out/loadtest ./cmd/loadtest
 
 FROM alpine:3.24 AS loadtool
 RUN apk add --no-cache ca-certificates && addgroup -g 10001 janus && adduser -D -H -u 10001 -G janus janus

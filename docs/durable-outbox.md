@@ -5,7 +5,7 @@
 The retry channel protects against temporary Redis failures while Janus is
 running. Memory disappears on a hard process kill. The outbox adds a local
 durability boundary: a completed accounting event is recoverable after its
-file and directory entry have been successfully flushed to persistent storage.
+journal frame has been successfully flushed to persistent storage.
 
 An outbox is a collection of records waiting for delivery. PostgreSQL is still
 the reporting database; Redis is still the persistent delivery queue. The local
@@ -17,41 +17,48 @@ flowchart TD
   C[Authenticated client] --> A{Seat and outbox capacity available?}
   A -->|No| E[503 before quota or provider call]
   A -->|Yes| P[Quota, cache, provider and response]
-  P --> O[Write event to temporary file and fsync]
-  O --> R[Rename to final file and fsync directory]
+  P --> O[Queue save in bounded journal writer]
+  O --> R[Batch write and shared fsync]
   R --> Q[Deliver to persistent Redis]
-  Q -->|Confirmed| D[Delete local file and fsync directory]
+  Q -->|Confirmed| D[Batch journal acknowledgement and fsync]
   D --> F[Release storage reservation and seat]
-  Q -->|Uncertain| B[Keep file; pause admissions; retry]
+  Q -->|Uncertain| B[Keep pending record; pause admissions; retry]
   S[Restart: lock and validate outbox] --> B
   Q --> W[Existing worker commits to PostgreSQL]
 ```
 
-## File lifecycle
+## Journal lifecycle
 
-Every event uses a SHA-256 filename derived from its original request ID.
-Hashing keeps arbitrary IDs out of filesystem paths; it is not a content
-checksum. Files contain validated JSON and are limited to 16 KiB.
+The current outbox uses one append-only `journal.v1`, rather than one file per
+request. A bounded writer channel collects up to 32 save/acknowledgement
+operations, waiting up to 1 ms to form each batch. One file write and `fsync`
+confirms the batch together. Queueing, disk sync and compaction can add further
+waiting; the 1 ms collection window is not a total latency guarantee.
 
-Janus creates a temporary file, writes the event, calls `File.Sync`, closes it,
-renames it to its final name, and syncs the directory. Flushing the file persists
-its bytes; flushing the directory persists the final filename. Only then does
-Janus try Redis. Confirmed Redis delivery permits removal of the local file,
-followed by another directory flush. Operations for the same request ID are
-serialized through a fixed set of locks. Independent records can flush
-concurrently, bounded by admitted work; disk I/O never holds the metadata lock.
+Each frame contains a version marker, payload length, CRC32 checksum and JSON.
+A save contains validated accounting metadata; an acknowledgement contains the
+original request ID after Redis confirms delivery. Callers wait for their batch
+confirmation. The live index changes only after successful disk sync.
 
-At startup, a Linux advisory lock prevents two processes from owning the same
-directory. Janus validates every final record before starting recovery. A corrupt
-or unexpected file stops startup and is retained for inspection. Temporary
-files from incomplete writes are discarded: they never crossed the local
-confirmation boundary. Recovered records are delivered before new chat
-admissions reopen. No model is called during replay.
+Startup takes an exclusive Linux lock, validates the journal and rebuilds
+pending events by applying saves and acknowledgements in order. A short trailing
+header/payload is truncated and flushed. Complete corrupt frames stop startup
+and are retained for inspection. Complete unconfirmed frames may survive and
+replay safely with database deduplication. No model is called during replay.
+
+Failed writes close admission. Before another append, the writer truncates to
+its last confirmed offset and flushes that repair. Compaction replaces delivered
+history with a flushed checkpoint containing only pending events, then syncs the
+directory. Both old and new files describe the same pending set during replacement.
+
+Existing SHA-256-named JSON files are imported into the journal and flushed before
+deletion. Interrupted migration may repeat delivery but preserves original IDs.
+The old binary cannot read this new journal. See [group commit](group-commit.md).
 
 The same request ID survives every retry and restart. Redis's recent-handoff
 marker reduces repeated deliveries; PostgreSQL's permanent primary key prevents
 duplicate accounting if Redis receives an event again, including after the
-marker expires. The SQL worker may still be writing after local removal; at that
+marker expires. The SQL worker may still be writing after journal acknowledgement; at that
 point persistent Redis owns recovery.
 
 ## Configuration and limits
@@ -72,7 +79,7 @@ data. Outbox data is excluded from Git and Docker build inputs.
 The 32 MiB setting allows 2048 event slots of at most 16 KiB each. Admission
 reserves a slot before invoking the chat handler. Existing records plus active
 reservations consume capacity conservatively. A full outbox rejects arrivals
-with the existing 503 response. Filesystem metadata, temporary files and filesystem
+with the existing 503 response. Journal history, checkpoints, metadata and filesystem
 allocation overhead are additional disk usage: this is a logical event-payload
 bound, not a partition quota or a guarantee that the host has free disk space.
 
@@ -94,8 +101,8 @@ Authenticated `/metrics` exposes `janus_outbox_records`, `janus_outbox_bytes`,
 `janus_outbox_writes_total`, `janus_outbox_errors_total`, and
 `janus_outbox_replayed_total`. Counters reset on restart; records remain on disk.
 The `janus_outbox_write_duration_seconds` histogram measures local writes and
-flushes, including lock waits. The existing usage-enqueue stage now includes
-local persistence, Redis confirmation, and confirmed local deletion on its
+flushes, including queue and batch waits. The existing usage-enqueue stage now includes
+local persistence, Redis confirmation, and confirmed journal acknowledgement on its
 fast path. Completion latency can rise; first-token streaming still precedes
 the completion outbox write.
 
@@ -105,9 +112,10 @@ Tests kill a real subprocess after local confirmation, reopen its outbox and
 replay into Redis/PostgreSQL. They cover both a missing database record and an
 already committed record. Further tests cover capacity reservations, admission
 rejection before the handler, exclusive ownership, corruption, and injected
-directory-flush failure preventing premature Redis delivery.
+file-flush failure preventing premature Redis delivery. Journal tests also
+cover partial appends, checksum damage, migration and compaction failures.
 
-Concurrency tests verify independent disk flushes proceed together and
+Concurrency tests verify queued operations share a durable flush and
 same-request publishers write once. Shutdown waits for active publishers before
 releasing exclusive ownership. An unconfirmed record survives shutdown and
 replays on reopening. Slow local flushing does not consume Redis's timeout.
@@ -119,7 +127,7 @@ outside this guarantee. Backups, replication and provider invoice reconciliation
 remain necessary production work. Saved events are metadata, not a way to
 reconstruct or resume an interrupted model response.
 
-## Local measurements
+## Historical per-file measurements
 
 Separate-container fake-provider load phases ran for 10 seconds each. These
 measure successful-response completion latency including upstream time and
@@ -148,10 +156,10 @@ The prior no-outbox 30-second run admitted 29744/30000 JSON and 29368/30000 SSE
 requests at 1000 RPS, with p99 36.50/48.62 ms. The runs have different durations
 and share the laptop's WSL resources, so this is not a controlled overhead
 comparison. It does demonstrate a substantial throughput cost from durable
-file writes. The 5-10 ms proxy-overhead goal remains unfinished. A batched
-durable journal/group-commit design is a possible next optimization; production
-capacity must be established with longer tests and representative storage.
+file writes. The 5-10 ms proxy-overhead goal remains unfinished. The current
+batched journal is intended to reduce flush work, but its performance still
+needs measurement; production capacity requires longer tests and representative storage.
 
-Latest raw reports are in `.cache/loadtest/`; earlier outbox-serialized reports
+These historical raw reports are in `.cache/loadtest-before-group-commit/`; earlier outbox-serialized reports
 are in `.cache/loadtest-outbox-serial/` and no-outbox reports in
 `.cache/loadtest-before-outbox/`.

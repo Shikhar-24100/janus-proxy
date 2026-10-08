@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,23 +15,39 @@ import (
 )
 
 const maxOutboxEventBytes = 16 << 10
+const outboxJournalName = "journal.v1"
 
-// Only accounting metadata lives here: no prompts, responses, or API keys.
-// A single process owns a directory; each replica needs its own persistent volume.
+// The writer owns the journal. mu protects the live index and reservations,
+// and is never held across disk I/O. Each replica owns its own directory.
 type usageOutbox struct {
-	mu              sync.Mutex
-	stripes         [64]sync.Mutex
-	dir             string
-	lock            *os.File
-	files           map[string]int64
-	reserved, limit int
-	blocked         bool
-	recovered       []requestEvent
-	writes          atomic.Uint64
-	errors          atomic.Uint64
-	replayed        atomic.Uint64
-	// Injectable filesystem boundaries let tests exercise disk/flush failures.
-	syncDir func(string) error
+	mu                                                sync.Mutex
+	dir                                               string
+	lock, journal                                     *os.File
+	records                                           map[string]json.RawMessage
+	reserved, limit                                   int
+	blocked                                           bool
+	recovered                                         []requestEvent
+	writes, errors, replayed                          atomic.Uint64
+	batches, operations, syncs, compactions, repaired atomic.Uint64
+	journalBytes                                      atomic.Int64
+	offset, compactAt                                 int64
+	rollback, directoryPending                        bool
+	queue                                             chan outboxCommand
+	stop, done                                        chan struct{}
+	lifeMu                                            sync.Mutex
+	closed                                            bool
+	active                                            sync.WaitGroup
+	closeOnce                                         sync.Once
+	// Injectable boundaries for failure tests.
+	syncFile  func(*os.File) error
+	syncDir   func(string) error
+	writeFile func(*os.File, []byte) (int, error)
+}
+
+type outboxCommand struct {
+	id   string
+	data json.RawMessage // nil means Redis has confirmed delivery.
+	done chan error
 }
 
 func openUsageOutbox(path, sizeMB string) (*usageOutbox, error) {
@@ -49,8 +66,6 @@ func openUsageOutbox(path, sizeMB string) (*usageOutbox, error) {
 	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, errors.New("cannot create usage outbox directory")
 	}
-	// Compose pre-creates this path inside a persistent Linux volume. Also flush
-	// its parent when opening so a newly created final directory is recorded.
 	if os.IsNotExist(before) {
 		if err := syncOutboxDir(filepath.Dir(path)); err != nil {
 			return nil, errors.New("cannot flush usage outbox parent; durable outbox requires Linux")
@@ -60,49 +75,108 @@ func openUsageOutbox(path, sizeMB string) (*usageOutbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	o := &usageOutbox{dir: path, lock: lock, files: make(map[string]int64), limit: limitMB * (1 << 20) / maxOutboxEventBytes, syncDir: syncOutboxDir}
+	o := &usageOutbox{dir: path, lock: lock, records: make(map[string]json.RawMessage), limit: limitMB * (1 << 20) / maxOutboxEventBytes,
+		compactAt: int64(min(limitMB, 4)) << 20, syncFile: func(f *os.File) error { return f.Sync() }, syncDir: syncOutboxDir,
+		writeFile: func(f *os.File, data []byte) (int, error) { return f.Write(data) }}
 	ok := false
 	defer func() {
 		if !ok {
 			o.close()
 		}
 	}()
-	entries, err := os.ReadDir(path)
+	legacy, err := o.readLegacy()
+	if err != nil {
+		return nil, err
+	}
+	o.journal, err = os.OpenFile(filepath.Join(path, outboxJournalName), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, errors.New("cannot open usage journal")
+	}
+	if err := o.loadJournal(); err != nil {
+		return nil, err
+	}
+	// Persist imports before deleting old files. Repeated migration is safe:
+	// PostgreSQL deduplicates original IDs even if a delivery is repeated.
+	for id, data := range legacy {
+		if old, exists := o.records[id]; exists {
+			if !bytes.Equal(old, data) {
+				return nil, errors.New("conflicting legacy and journal usage records")
+			}
+			continue
+		}
+		frame := encodeOutboxFrame(outboxRecord{Put: data})
+		if n, err := o.journal.Write(frame); err != nil || n != len(frame) {
+			return nil, errors.New("cannot migrate legacy usage event")
+		}
+		o.offset += int64(len(frame))
+		o.records[id] = data
+	}
+	if err := o.flush(o.journal); err != nil {
+		return nil, errors.New("cannot flush usage journal")
+	}
+	if err := o.syncDir(path); err != nil {
+		return nil, errors.New("cannot flush usage journal directory")
+	}
+	for id := range legacy {
+		if err := os.Remove(filepath.Join(path, outboxName(id))); err != nil {
+			return nil, errors.New("cannot remove migrated usage file")
+		}
+	}
+	if len(legacy) > 0 {
+		if err := o.syncDir(path); err != nil {
+			return nil, errors.New("cannot confirm legacy file removal")
+		}
+	}
+	for _, data := range o.records {
+		event, _ := decodeUsageEvent(string(data))
+		o.recovered = append(o.recovered, event)
+	}
+	o.journalBytes.Store(o.offset)
+	o.queue, o.stop, o.done = make(chan outboxCommand, 64), make(chan struct{}), make(chan struct{})
+	go o.runWriter()
+	ok = true
+	return o, nil
+}
+
+func (o *usageOutbox) readLegacy() (map[string]json.RawMessage, error) {
+	entries, err := os.ReadDir(o.dir)
 	if err != nil {
 		return nil, errors.New("cannot read usage outbox")
 	}
+	legacy := make(map[string]json.RawMessage)
 	for _, entry := range entries {
 		name := entry.Name()
 		if name == ".lock" {
 			continue
 		}
-		if strings.HasPrefix(name, ".event-") && strings.HasSuffix(name, ".tmp") {
-			if err := os.Remove(filepath.Join(path, name)); err != nil {
-				return nil, errors.New("cannot clean uncommitted outbox file")
+		if (strings.HasPrefix(name, ".event-") || strings.HasPrefix(name, ".journal-")) && strings.HasSuffix(name, ".tmp") {
+			if err := os.Remove(filepath.Join(o.dir, name)); err != nil {
+				return nil, errors.New("cannot clean uncommitted usage file")
 			}
 			continue
 		}
 		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() || info.Size() > maxOutboxEventBytes || !strings.HasSuffix(name, ".json") {
-			return nil, errors.New("unexpected or oversized usage outbox file; inspect before restarting")
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, errors.New("unexpected usage outbox entry")
 		}
-		data, err := os.ReadFile(filepath.Join(path, name))
+		if name == outboxJournalName {
+			continue
+		}
+		if info.Size() > maxOutboxEventBytes || !strings.HasSuffix(name, ".json") {
+			return nil, errors.New("unexpected or oversized usage outbox file")
+		}
+		data, err := os.ReadFile(filepath.Join(o.dir, name))
 		if err != nil {
-			return nil, errors.New("cannot read usage outbox event")
+			return nil, errors.New("cannot read legacy usage event")
 		}
 		event, err := decodeUsageEvent(string(data))
 		if err != nil || name != outboxName(event.RequestID) {
-			return nil, errors.New("corrupt usage outbox event; retained for inspection")
+			return nil, errors.New("corrupt legacy usage event; retained for inspection")
 		}
-		o.files[name] = info.Size()
-		o.recovered = append(o.recovered, event)
+		canonical, _ := json.Marshal(event)
+		legacy[event.RequestID] = canonical
 	}
-	// Existing backlog is replayed even if a reduced configuration is now full.
-	if err := o.syncDir(path); err != nil {
-		return nil, errors.New("cannot flush usage outbox directory")
-	}
-	ok = true
-	return o, nil
+	return legacy, nil
 }
 
 func outboxName(id string) string {
@@ -113,7 +187,7 @@ func outboxName(id string) string {
 func (o *usageOutbox) reserve() (func(), bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.blocked || len(o.files)+o.reserved >= o.limit {
+	if o.blocked || len(o.records)+o.reserved >= o.limit {
 		return nil, false
 	}
 	o.reserved++
@@ -121,116 +195,55 @@ func (o *usageOutbox) reserve() (func(), bool) {
 	return func() { once.Do(func() { o.mu.Lock(); o.reserved--; o.mu.Unlock() }) }, true
 }
 
-func (o *usageOutbox) put(event requestEvent) (err error) {
+func (o *usageOutbox) put(event requestEvent) error {
 	data, err := json.Marshal(event)
 	if err != nil || len(data) > maxOutboxEventBytes || validateUsageEvent(event) != nil {
 		return errors.New("invalid or oversized outbox event")
 	}
-	// Serialize the same request ID, but let independent files flush concurrently.
-	// Holding the registry lock across fsync would queue every request behind disk.
-	hash := sha256.Sum256([]byte(event.RequestID))
-	stripe := &o.stripes[int(hash[0])%len(o.stripes)]
-	stripe.Lock()
-	defer stripe.Unlock()
-	defer func() {
-		o.mu.Lock()
-		defer o.mu.Unlock()
-		if err != nil {
-			o.blocked = true
-			o.errors.Add(1)
-		} else {
-			o.blocked = false
-		}
-	}()
-	name := outboxName(event.RequestID)
-	o.mu.Lock()
-	if _, exists := o.files[name]; exists {
-		o.mu.Unlock()
-		// A previous directory flush may have failed after rename. Confirm it now.
-		return o.syncDir(o.dir)
-	}
-	if len(o.files) >= o.limit {
-		o.mu.Unlock()
-		return errors.New("usage outbox is full")
-	}
-	// Reserve the filename before I/O so concurrent publishers cannot exceed capacity.
-	o.files[name] = 0
-	o.mu.Unlock()
-	renamed := false
-	defer func() {
-		if !renamed {
-			o.mu.Lock()
-			delete(o.files, name)
-			o.mu.Unlock()
-		}
-	}()
-	f, err := os.CreateTemp(o.dir, ".event-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	defer func() { f.Close(); os.Remove(tmp) }()
-	if _, err = f.Write(data); err != nil {
-		return err
-	}
-	if err = f.Sync(); err != nil {
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(tmp, filepath.Join(o.dir, name)); err != nil {
-		return err
-	}
-	renamed = true
-	o.mu.Lock()
-	o.files[name] = int64(len(data))
-	o.mu.Unlock()
-	if err = o.syncDir(o.dir); err != nil {
-		return err
-	}
-	o.writes.Add(1)
-	return nil
+	return o.submit(outboxCommand{id: event.RequestID, data: data, done: make(chan error, 1)})
 }
 
-func (o *usageOutbox) remove(id string) (err error) {
-	hash := sha256.Sum256([]byte(id))
-	stripe := &o.stripes[int(hash[0])%len(o.stripes)]
-	stripe.Lock()
-	defer stripe.Unlock()
-	defer func() {
-		if err != nil {
-			o.mu.Lock()
-			o.blocked = true
-			o.mu.Unlock()
-			o.errors.Add(1)
-		}
-	}()
-	name := outboxName(id)
-	if err = os.Remove(filepath.Join(o.dir, name)); err != nil && !os.IsNotExist(err) {
-		return err
+func (o *usageOutbox) remove(id string) error {
+	return o.submit(outboxCommand{id: id, done: make(chan error, 1)})
+}
+
+func (o *usageOutbox) submit(cmd outboxCommand) error {
+	o.lifeMu.Lock()
+	if o.closed {
+		o.lifeMu.Unlock()
+		return errors.New("usage outbox is closed")
 	}
-	// Do not mark removal complete until its directory entry is durably deleted.
-	if err = o.syncDir(o.dir); err != nil {
-		return err
-	}
-	o.mu.Lock()
-	delete(o.files, name)
-	o.mu.Unlock()
-	return nil
+	o.active.Add(1)
+	o.lifeMu.Unlock()
+	defer o.active.Done()
+	o.queue <- cmd
+	return <-cmd.done
 }
 
 func (o *usageOutbox) snapshot() (records, bytes, reserved, capacity int64, blocked bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for _, size := range o.files {
-		bytes += size
+	for _, data := range o.records {
+		bytes += int64(len(data))
 	}
-	return int64(len(o.files)), bytes, int64(o.reserved), int64(o.limit * maxOutboxEventBytes), o.blocked
+	return int64(len(o.records)), bytes, int64(o.reserved), int64(o.limit * maxOutboxEventBytes), o.blocked
 }
 
 func (o *usageOutbox) close() {
-	if o.lock != nil {
-		o.lock.Close()
-	}
+	o.closeOnce.Do(func() {
+		o.lifeMu.Lock()
+		o.closed = true
+		o.lifeMu.Unlock()
+		o.active.Wait()
+		if o.done != nil {
+			close(o.stop)
+			<-o.done
+		}
+		if o.journal != nil {
+			o.journal.Close()
+		}
+		if o.lock != nil {
+			o.lock.Close()
+		}
+	})
 }

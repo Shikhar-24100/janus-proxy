@@ -430,7 +430,8 @@ See [observability notes and examples](docs/observability.md).
 
 ## Durable usage storage
 
-The Linux Compose stack also enables a persistent local completion outbox.
+The Linux Compose stack also enables a persistent local completion outbox with
+[batched journal writes](docs/group-commit.md).
 Completed events are flushed locally before Redis delivery, and unfinished
 handoffs replay on restart. See [outbox design and recovery boundaries](docs/durable-outbox.md).
 

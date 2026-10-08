@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,7 +86,7 @@ func TestOutboxFlushFailureDoesNotEnqueue(t *testing.T) {
 	o := outboxFixture(t)
 	p := queueFixture(t, &failingUsageStore{})
 	p.outbox = o
-	o.syncDir = func(string) error { return errors.New("disk flush failed") }
+	o.syncFile = func(*os.File) error { return errors.New("disk flush failed") }
 	event := sampleUsageEvent()
 	if err := p.handoff(context.Background(), event); err == nil {
 		t.Fatal("unflushed record was accepted")
@@ -99,7 +97,7 @@ func TestOutboxFlushFailureDoesNotEnqueue(t *testing.T) {
 	if _, ok := o.reserve(); ok {
 		t.Fatal("disk failure did not pause admission")
 	}
-	o.syncDir = syncOutboxDir
+	o.syncFile = func(f *os.File) error { return f.Sync() }
 	if err := p.handoff(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
@@ -129,9 +127,9 @@ func TestOutboxSlowFlushDoesNotSpendRedisBudget(t *testing.T) {
 	o := outboxFixture(t)
 	p := queueFixture(t, &failingUsageStore{})
 	p.outbox = o
-	o.syncDir = func(path string) error {
+	o.syncFile = func(f *os.File) error {
 		time.Sleep(250 * time.Millisecond)
-		return syncOutboxDir(path)
+		return f.Sync()
 	}
 	if err := p.handoff(context.Background(), sampleUsageEvent()); err != nil {
 		t.Fatal("local flush spent Redis's separate timeout budget:", err)
@@ -172,42 +170,49 @@ func TestOutboxUnconfirmedHandoffSurvivesShutdown(t *testing.T) {
 	waitFor(t, func() bool { return recovery.persisted.Load() == 1 && recovery.pending.Load() == 0 })
 }
 
-func TestOutboxIndependentFlushesDoNotSerialize(t *testing.T) {
+func TestOutboxGroupCommitConfirmsAfterSharedFlush(t *testing.T) {
 	o := outboxFixture(t)
-	first, second := sampleUsageEvent(), sampleUsageEvent()
-	for sha256.Sum256([]byte(first.RequestID))[0]%64 == sha256.Sum256([]byte(second.RequestID))[0]%64 {
-		second.RequestID = rand.Text()
-	}
-	entered := make(chan struct{}, 2)
-	proceed := make(chan struct{})
+	entered, proceed := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(proceed) })
-	o.syncDir = func(path string) error { entered <- struct{}{}; <-proceed; return syncOutboxDir(path) }
-	results := make(chan error, 2)
-	go func() { results <- o.put(first) }()
-	go func() { results <- o.put(second) }()
-	for range 2 {
+	syncBefore := o.syncs.Load()
+	o.syncFile = func(f *os.File) error {
 		select {
 		case <-entered:
-		case <-time.After(2 * time.Second):
-			once.Do(func() { close(proceed) })
-			<-results
-			<-results
-			t.Fatal("independent event waited behind another event's fsync")
+		default:
+			close(entered)
+			<-proceed
 		}
+		return f.Sync()
+	}
+	first := make(chan error, 1)
+	go func() { first <- o.put(sampleUsageEvent()) }()
+	<-entered
+	select {
+	case <-first:
+		t.Fatal("put confirmed before fsync")
+	default:
+	}
+	commands := make([]outboxCommand, outboxBatchSize)
+	for i := range commands {
+		event := sampleUsageEvent()
+		data, _ := json.Marshal(event)
+		commands[i] = outboxCommand{id: event.RequestID, data: data, done: make(chan error, 1)}
+		o.queue <- commands[i]
 	}
 	once.Do(func() { close(proceed) })
-	for range 2 {
-		if err := <-results; err != nil {
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		if err := <-command.done; err != nil {
 			t.Fatal(err)
 		}
 	}
-	n, _, _, _, _ := o.snapshot()
-	if n != 2 {
-		t.Fatal("concurrent writes lost records")
+	if o.batches.Load() != 2 || o.syncs.Load()-syncBefore != 2 || o.operations.Load() != 33 {
+		t.Fatal("32 queued events did not share one durable flush")
 	}
 }
-
 func TestOutboxConcurrentSameRequestWritesOnce(t *testing.T) {
 	o := outboxFixture(t)
 	event := sampleUsageEvent()
@@ -234,14 +239,14 @@ func TestOutboxShutdownKeepsOwnershipUntilPublishEnds(t *testing.T) {
 	entered, proceed := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(proceed) })
-	o.syncDir = func(path string) error {
+	o.syncFile = func(f *os.File) error {
 		select {
 		case <-entered:
 		default:
 			close(entered)
 		}
 		<-proceed
-		return syncOutboxDir(path)
+		return f.Sync()
 	}
 	published, closed := make(chan struct{}), make(chan struct{})
 	go func() { p.publish(sampleUsageEvent()); close(published) }()
@@ -281,6 +286,17 @@ func TestOutboxCrashHelper(t *testing.T) {
 	o, err := openUsageOutbox(path, "1")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if os.Getenv("JANUS_TEST_OUTBOX_PHASE") == "partial" {
+		o.writeFile = func(f *os.File, data []byte) (int, error) {
+			n, err := f.Write(data[:len(data)/2])
+			if err != nil {
+				return n, err
+			}
+			fmt.Println("outbox-partial")
+			time.Sleep(time.Hour)
+			return n, nil
+		}
 	}
 	if err := o.put(event); err != nil {
 		t.Fatal(err)

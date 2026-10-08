@@ -48,9 +48,9 @@ Handler completion -> settle actual usage in Redis
   | unknown usage -> keep reservation until original window expires
   v
 Update metrics -> enqueue JSON request log -> background console writer
-               -> Linux: fsync completion event into persistent local outbox
+               -> Linux: group-commit completion event into persistent journal
                -> bounded persistent Redis usage enqueue (separate 6381 server)
-                  -> confirmed: remove local outbox record; restart replays unfinished records
+                  -> confirmed: journal delivery acknowledgement; restart replays pending events
                   -> unconfirmed: retain event/seat, pause admissions, retry
                   -> background worker -> PostgreSQL request + attempt transaction
                   -> commit -> acknowledge/delete queue entry
@@ -81,8 +81,9 @@ heuristic; accurate model tokenizers remain future work.
 
 ## Rough progress estimate
 
-About **65% of the first production-focused version** after adding durable usage storage, tenant management, exact caching,
-logs and metrics. This is an effort estimate, not a measured percentage or
+About **75% of the first production-focused version** with durable usage recovery,
+tenant management, exact caching, logs, metrics and load-tested admission controls.
+This is an effort estimate, not a measured percentage or
 production-readiness claim. Optional semantic caching is outside this scope.
 
 | Area | Status |

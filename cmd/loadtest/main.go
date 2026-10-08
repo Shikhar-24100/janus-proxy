@@ -525,6 +525,10 @@ func run() error {
 				fmt.Println("usage handoff count mismatch")
 				p.ValidationErrors = append(p.ValidationErrors, "usage handoff count mismatch")
 			}
+			if strings.HasPrefix(p.Name, "gateway") && (after["janus_outbox_operations_total"]-before["janus_outbox_operations_total"] != 2*float64(p.Success) || after["janus_outbox_writes_total"]-before["janus_outbox_writes_total"] != float64(p.Success)) {
+				failed = true
+				p.ValidationErrors = append(p.ValidationErrors, "journal save/ack operation count mismatch")
+			}
 			result.Phases = append(result.Phases, p)
 			fmt.Printf("%s %d rps: %d/%d successful, %d rejected, p50 %.2f ms p99 %.2f ms, backlog %d\n", p.Name, rate, p.Success, p.Scheduled, p.Rejected, p.P50MS, p.P99MS, p.Backlog)
 			if err := save(result); err != nil {
