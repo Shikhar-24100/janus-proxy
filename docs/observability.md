@@ -61,12 +61,17 @@ counts only tenant-attributed requests when usage storage is enabled.
 Overload rejections do not enqueue usage. This histogram measures the initial
 handoff/retention step; background retry time is visible through pending jobs,
 not added to the same histogram. With the durable outbox enabled, the initial
-handoff also includes local persistence and deletion. The outbox write stage
+handoff also includes local persistence and journal acknowledgement. The outbox write stage
 separately observes local writes/flushes, including retries. See
 [admission and retry design](overload-protection.md) and [outbox metrics](durable-outbox.md).
 Settlement does not run when provider usage is unknown. Cache, HTTP and provider generation
 contribute additional time outside these stages. Sub-millisecond buckets
 make fast local operations visible.
+
+The background worker also exposes `janus_usage_claim_duration_seconds`,
+`janus_usage_read_duration_seconds`, `janus_usage_store_duration_seconds`, and
+`janus_usage_ack_duration_seconds`. Read duration includes idle blocking. These
+measure worker calls/batches, not HTTP requests; see [worker metrics and tuning](usage-worker-tuning.md).
 
 ## Counters, gauges, and histograms
 

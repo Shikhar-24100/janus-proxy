@@ -6,7 +6,7 @@ import (
 )
 
 // Fixed stages avoid tenant/model labels and include Redis connection-pool waits.
-var stageNames = [...]string{"quota_admission", "quota_settlement", "usage_enqueue", "outbox_write"}
+var stageNames = [...]string{"quota_admission", "quota_settlement", "usage_enqueue", "outbox_write", "usage_claim", "usage_read", "usage_store", "usage_ack"}
 
 func (t *telemetry) observeStage(stage int, started time.Time) {
 	if t == nil {

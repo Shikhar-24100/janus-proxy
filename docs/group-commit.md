@@ -123,7 +123,7 @@ Successful-response percentiles include upstream time and scheduling lag and
 exclude deliberate overload rejections. The runs share a laptop/WSL host and
 occurred on different days; they are local observations, not isolated causal
 measurements or a production guarantee. The 5-10 ms overhead goal remains open.
-Raw reports are in `.cache/loadtest/`; the previous per-file results are in
+These raw reports are preserved in `.cache/loadtest-before-worker/`; the previous per-file results are in
 `.cache/loadtest-before-group-commit/`.
 
 Binary image builds now keep compiler caches and temporary files in RAM rather

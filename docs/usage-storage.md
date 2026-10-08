@@ -37,7 +37,10 @@ Client -> tenant authentication -> quota/cache -> provider JSON or SSE
                          |
                construct usage event
                          |
+              durable local journal save
+                         |
               bounded Redis enqueue (200 ms budget)
+              then local journal acknowledgement
                          v
               Redis Stream: janus:usage:v1
                          |
@@ -52,8 +55,10 @@ Client -> tenant authentication -> quota/cache -> provider JSON or SSE
                   Redis XACK + XDEL
 ```
 
-Database writes do not run in the request handler. Queue handoff does: a 200 ms
-budget bounds that operation, including after client cancellation. Writing the
+Database writes do not run in the request handler. Queue handoff does: the local
+journal confirms a save before Redis delivery, then confirms its acknowledgement.
+The 200 ms budget bounds the Redis attempt, including after client cancellation;
+it does not bound local disk queueing or flushes. Writing the
 response body does not guarantee net/http has already flushed or closed it, so
 this handoff can still add completion latency. Streaming text is forwarded as
 before; queue handoff happens after streaming and quota settlement.
@@ -64,12 +69,15 @@ The HTTP response can finish while that retained job retries.
 Our existing console-log channel is separate and best effort. A Go channel holds
 data in process memory and loses it on a crash; it is not the durable usage queue.
 The worker uses at most two PostgreSQL connections, one worker per Janus process,
-and batches of at most 16 queued messages. Available messages are sent together
+and batches of at most 64 queued messages. Available messages are sent together
 through pgx in one PostgreSQL transaction; the worker does not wait to fill a batch.
 After commit, one Redis script acknowledges and removes all valid entries in that
 batch. Failed batches stay pending and replay safely; malformed neighbors stay
 pending while valid entries can proceed. Usage Redis has a bounded pool of 16
 connections shared by publishers and the worker, replacing the earlier four.
+
+See [worker tuning and stage metrics](usage-worker-tuning.md) for the measurements
+behind the batch size and recovery scan schedule.
 
 ## Delivery, retry and duplicates
 
@@ -78,7 +86,9 @@ in the pending list. A database failure leaves it unacknowledged. The worker
 retries with pauses of 1, 2, 4, 8 and then at most 10 seconds.
 
 After a worker crash, another worker can reclaim entries idle for at least
-30 seconds. Reclaim scanning runs alongside reading new work. A database commit
+30 seconds. The worker completes recovery scan pages, then schedules the next
+scan about one second later; intervening cycles read new work directly. Blocking
+reads, processing and retry delays can postpone the next scan. A database commit
 can succeed just before a crash prevents acknowledgement. That event will be
 delivered again: this is at-least-once delivery, not exactly-once transport.
 
@@ -203,14 +213,14 @@ concurrent duplicate inserts, commit-before-ack recovery and daily-report maths.
 
 ## Remaining reliability limits
 
-With the Linux outbox enabled, an event is recoverable after local file and
-directory confirmation, before persistent Redis accepts it. Without the outbox,
+With the Linux outbox enabled, an event is recoverable after its journal save
+is confirmed, before persistent Redis accepts it. Without the outbox,
 recovery begins at persistent Redis acceptance. A crash during generation or
 before local confirmation can still leave a missing completion event. An enqueue timeout can be ambiguous:
 Redis might have accepted it. Janus now retains the event and its admission seat
 in a bounded retry channel, pauses new admissions and retries confirmation.
 Recent handoff markers reduce duplicate Redis deliveries; PostgreSQL request IDs
-prevent duplicate accounting. Confirmed outbox files replay on restart; other
+prevent duplicate accounting. Pending journal records replay on restart; other
 retained jobs are not crash durable. See [outbox recovery](durable-outbox.md)
 and [overload and retry design](overload-protection.md).
 

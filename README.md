@@ -463,8 +463,10 @@ core results do not validate full gateway overhead. Reports are in `.cache/perf`
 The benchmark defaults to two Go CPUs; use `-GoCPUs 1`, `2`, or `4` to compare
 runtime configurations. Reports also include means for quota admission,
 settlement and durable enqueue. The worker now commits available events in
-batches of up to 16 before acknowledging them, and upstream HTTP clients retain
+batches of up to 64 before acknowledging them, and upstream HTTP clients retain
 idle connections after concurrent bursts.
+See [usage worker tuning](docs/usage-worker-tuning.md) for stage measurements,
+recovery scans and the longer load-test comparison.
 See [percentiles, benchmark scenarios and interpretation](docs/performance.md).
 
 ## Check

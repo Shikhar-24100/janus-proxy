@@ -17,6 +17,8 @@ import (
 const usageStream = "janus:usage:v1"
 const usageGroup = "postgres-v1"
 const maxUsageQueue = 100000
+const usageWorkerBatchSize = 64
+const usageClaimInterval = time.Second
 
 var errInvalidQueuedUsage = errors.New("invalid usage queue entry")
 
@@ -50,6 +52,7 @@ type usagePipeline struct {
 	queued        atomic.Uint64
 	enqueueErr    atomic.Uint64
 	persisted     atomic.Uint64
+	batchEvents   atomic.Uint64
 	workerErr     atomic.Uint64
 	invalid       atomic.Uint64
 	cancel        context.CancelFunc
@@ -312,14 +315,33 @@ func (p *usagePipeline) retryHandoff(ctx context.Context, job usageRetry) bool {
 
 func (p *usagePipeline) run(ctx context.Context) {
 	cursor := "0-0"
+	var nextClaim time.Time
 	backoff := time.Second
 	for ctx.Err() == nil {
-		messages, next, err := p.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{Stream: p.stream, Group: p.group, Consumer: p.consumer, MinIdle: p.claimIdle, Start: cursor, Count: 16}).Result()
+		var messages []redis.XMessage
+		var err error
+		// Finish a recovery scan promptly, then avoid scanning an empty pending
+		// list on every delivery cycle. New work never waits for the scan timer.
+		if !time.Now().Before(nextClaim) {
+			started := time.Now()
+			var next string
+			messages, next, err = p.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{Stream: p.stream, Group: p.group, Consumer: p.consumer, MinIdle: p.claimIdle, Start: cursor, Count: usageWorkerBatchSize}).Result()
+			p.metrics.observeStage(4, started)
+			if err == nil {
+				cursor = next
+				if cursor == "0-0" {
+					nextClaim = time.Now().Add(usageClaimInterval)
+				} else {
+					nextClaim = time.Time{}
+				}
+			}
+		}
 		if err == nil {
-			cursor = next
 			if len(messages) == 0 {
 				var streams []redis.XStream
-				streams, err = p.client.XReadGroup(ctx, &redis.XReadGroupArgs{Group: p.group, Consumer: p.consumer, Streams: []string{p.stream, ">"}, Count: 16, Block: 250 * time.Millisecond}).Result()
+				started := time.Now()
+				streams, err = p.client.XReadGroup(ctx, &redis.XReadGroupArgs{Group: p.group, Consumer: p.consumer, Streams: []string{p.stream, ">"}, Count: usageWorkerBatchSize, Block: 250 * time.Millisecond}).Result()
+				p.metrics.observeStage(5, started)
 				for _, stream := range streams {
 					messages = append(messages, stream.Messages...)
 				}
@@ -341,6 +363,7 @@ func (p *usagePipeline) run(ctx context.Context) {
 			if strings.HasPrefix(err.Error(), "NOGROUP") {
 				_ = p.initialize(ctx)
 				cursor = "0-0"
+				nextClaim = time.Time{}
 			}
 			continue
 		}
@@ -404,6 +427,8 @@ func (p *usagePipeline) processBatch(ctx context.Context, messages []redis.XMess
 		return errInvalidQueuedUsage
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	started := time.Now()
+	p.batchEvents.Add(uint64(len(events)))
 	var err error
 	if store, ok := p.store.(batchUsageStore); ok {
 		err = store.SaveBatch(writeCtx, events)
@@ -414,13 +439,17 @@ func (p *usagePipeline) processBatch(ctx context.Context, messages []redis.XMess
 			}
 		}
 	}
+	p.metrics.observeStage(6, started)
 	cancel()
 	if err != nil {
 		return err
 	}
 	ackCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	if err := acknowledgeUsageScript.Run(ackCtx, p.client, []string{p.stream}, args...).Err(); err != nil {
+	started = time.Now()
+	err = acknowledgeUsageScript.Run(ackCtx, p.client, []string{p.stream}, args...).Err()
+	p.metrics.observeStage(7, started)
+	if err != nil {
 		return err
 	}
 	p.persisted.Add(uint64(len(events)))

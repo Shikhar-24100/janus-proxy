@@ -389,10 +389,16 @@ func TestUsageEventValidation(t *testing.T) {
 type failingBatchStore struct {
 	failingUsageStore
 	batchCalls atomic.Int32
+	maxBatch   atomic.Int32
 }
 
 func (store *failingBatchStore) SaveBatch(ctx context.Context, events []requestEvent) error {
 	store.batchCalls.Add(1)
+	for previous := store.maxBatch.Load(); int32(len(events)) > previous; previous = store.maxBatch.Load() {
+		if store.maxBatch.CompareAndSwap(previous, int32(len(events))) {
+			break
+		}
+	}
 	if store.fail.Load() {
 		return errors.New("database unavailable")
 	}
@@ -402,6 +408,57 @@ func (store *failingBatchStore) SaveBatch(ctx context.Context, events []requestE
 		}
 	}
 	return nil
+}
+
+func TestRedisUsageWorkerDrainsRecoveryPagesAndNewWork(t *testing.T) {
+	store := &failingBatchStore{}
+	p := queueFixture(t, store)
+	p.capacity = 256
+	for range 150 {
+		if err := p.enqueue(context.Background(), sampleUsageEvent()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A dead consumer has more than two recovery pages assigned to it.
+	streams, err := p.client.XReadGroup(context.Background(), &redis.XReadGroupArgs{Group: p.group, Consumer: "dead-worker", Streams: []string{p.stream, ">"}, Count: 150, Block: -1}).Result()
+	if err != nil || len(streams) != 1 || len(streams[0].Messages) != 150 {
+		t.Fatal("cannot prepare pending recovery pages")
+	}
+	for range 10 {
+		if err := p.enqueue(context.Background(), sampleUsageEvent()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	p.start()
+	waitFor(t, func() bool { return p.persisted.Load() == 160 })
+	if store.maxBatch.Load() != 64 || p.client.XLen(context.Background(), p.stream).Val() != 0 {
+		t.Fatal("worker did not drain bounded recovery batches and new arrivals")
+	}
+	pending, err := p.client.XPending(context.Background(), p.stream, p.group).Result()
+	if err != nil || pending.Count != 0 || p.workerErr.Load() != 0 {
+		t.Fatal("recovered deliveries remain pending")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.saved) != 160 {
+		t.Fatal("recovery lost or duplicated usage identities")
+	}
+}
+
+func TestRedisUsageWorkerRevisitsYoungPendingEntry(t *testing.T) {
+	p := queueFixture(t, &failingBatchStore{})
+	p.claimIdle = 100 * time.Millisecond
+	p.metrics = newTelemetry(nil)
+	if err := p.enqueue(context.Background(), sampleUsageEvent()); err != nil {
+		t.Fatal(err)
+	}
+	readUsageMessage(t, p)
+	p.start()
+	waitFor(t, func() bool { return p.persisted.Load() == 1 })
+	if p.client.XLen(context.Background(), p.stream).Val() != 0 {
+		t.Fatal("periodic recovery did not drain pending work")
+	}
 }
 
 func TestRedisUsageBatchFailureAndPoisonNeighbor(t *testing.T) {

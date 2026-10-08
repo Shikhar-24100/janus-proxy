@@ -348,6 +348,7 @@ func (t *telemetry) serveMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&out, "# HELP janus_usage_enqueued_total Confirmed usage queue handoffs.\n# TYPE janus_usage_enqueued_total counter\njanus_usage_enqueued_total %d\n", p.queued.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_enqueue_errors_total Terminal invalid events or handoffs unconfirmed at shutdown.\n# TYPE janus_usage_enqueue_errors_total counter\njanus_usage_enqueue_errors_total %d\n", p.enqueueErr.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_persisted_total Saved and acknowledged deliveries, including deduplicated retries.\n# TYPE janus_usage_persisted_total counter\njanus_usage_persisted_total %d\n", p.persisted.Load())
+		fmt.Fprintf(&out, "# HELP janus_usage_worker_events_total Valid events submitted to the store, including retries.\n# TYPE janus_usage_worker_events_total counter\njanus_usage_worker_events_total %d\n", p.batchEvents.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_worker_errors_total Worker read, save or acknowledgement failures.\n# TYPE janus_usage_worker_errors_total counter\njanus_usage_worker_errors_total %d\n", p.workerErr.Load())
 		fmt.Fprintf(&out, "# HELP janus_usage_invalid_events_total Invalid entries encountered, including repeat encounters.\n# TYPE janus_usage_invalid_events_total counter\njanus_usage_invalid_events_total %d\n", p.invalid.Load())
 	}
