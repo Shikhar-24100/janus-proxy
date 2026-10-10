@@ -1,488 +1,135 @@
-# Janus Proxy
+# Janus
 
-A Go LLM gateway built one working step at a time.
+[![CI](https://github.com/Shikhar-24100/janus-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Shikhar-24100/janus-proxy/actions/workflows/ci.yml)
 
-Currently supports a local health endpoint and streaming or non-streaming chat requests to
-an OpenAI-compatible primary and optional fallback, client authentication, and Redis RPM/TPM quotas
-with provider usage reconciliation.
-Optional persistent Redis Streams and a PostgreSQL worker retain tenant usage history.
-`MAX_INFLIGHT` caps simultaneous work (default 32); overload returns 503 before
-provider calls. See [admission and usage recovery](docs/overload-protection.md).
+A Go LLM gateway with streaming, tenant quotas, provider fallback, exact caching,
+and durable usage history. Clients use a text-only subset of
+`POST /v1/chat/completions`; upstreams speak the OpenAI-compatible API.
 
-Provider calls also use an in-memory circuit breaker to stop repeatedly calling
-an upstream that is failing.
+**Status: portfolio MVP.** The main features work and have integration, crash,
+and load tests. Production readiness and the 5–10 ms overhead target remain open.
 
-## Run
+## Try the demo without API keys
 
-For the Linux container stack, see [the container design and commands](docs/containers.md).
-For independent client/provider/gateway containers, run `.\loadtest.ps1` and see
-[load-test design, results and limits](docs/load-testing.md).
-Run `.\containers.ps1 -Action init` once, then `.\containers.ps1 -Action up`
-to run Janus on localhost:8081 alongside isolated
-Redis/PostgreSQL containers. The existing Windows setup below uses port 8080.
-
-See [startup checks and WSL troubleshooting](docs/startup.md) if a local service
-fails to start. The scripts distinguish WSL startup failure from Linux service
-failures and reuse already responding project Redis instances.
-
-Requires Go 1.24 or newer and Redis. Our local Go installation already meets this.
-For this Windows setup, Ubuntu WSL already has Redis installed. First open a
-terminal and keep it running:
+Requires Docker Compose, or Ubuntu WSL with Docker Engine on Windows.
 
 ```powershell
-.\start-redis.ps1
+.\demo.ps1
 ```
 
-That script runs a dedicated, ephemeral Redis on loopback port 6380. It leaves
-existing Redis instances alone and keeps WSL active for localhost forwarding.
-Stopping or restarting this development Redis loses its quota state. For another
-Redis deployment, configure `REDIS_URL` instead of using this script.
+On Linux/macOS:
 
-The startup script already limits build concurrency with `-p 1`. For checks,
-use `go test -p 1 ./...` and `go vet -p 1 ./...` if Windows has little memory.
-An earlier workaround set `$env:GOMAXPROCS = '1'`; that also limits the running
-gateway. Remove it with `Remove-Item Env:GOMAXPROCS -ErrorAction SilentlyContinue`
-to use Go's runtime default, or set it deliberately for CPU comparisons.
+```sh
+docker compose -f compose.demo.yaml run --rm --build demo
+docker compose -f compose.demo.yaml down --volumes
+```
 
-For local Groq setup, copy `.env.example` to `.env`, set your provider key and
-your separate `JANUS_API_KEY` there, and run in a second terminal:
+This runs a narrated set of executable test scenarios with fake providers and
+separate disposable Redis/PostgreSQL services. It demonstrates authentication,
+streaming before generation finishes, rate limiting, cache hits, fallback,
+tenant isolation, metrics/privacy, usage deduplication, and crash recovery.
+No provider keys, real provider calls, or published ports are needed.
+See the [demo walkthrough](docs/demo.md) for the expected results.
+
+## Run with a provider
+
+From the repository root on Windows:
 
 ```powershell
-.\run.ps1
+Copy-Item .env.example .env
+# Edit .env: set OPENAI_API_KEY and your own JANUS_API_KEY.
+.\containers.ps1 -Action init  # once; never overwrites existing configuration
+.\containers.ps1 -Action up
 ```
 
-The script loads supported settings from `.env` (overriding values in that terminal)
-and uses the project-local Go toolchain if available, otherwise Go from PATH.
-The `.env` format is plain `NAME=value`, without quotes or inline comments.
-The real `.env` is ignored by Git; `.env.example` contains placeholders only.
+The container gateway listens on `http://localhost:8081`. Keep Ubuntu/WSL active
+while using its Docker Engine. After initialization, edit `.env.container` and
+`.container/tenants.json` for container settings; changing `.env` does not update
+those copies. Use `-Action down` to stop the stack; persistent volumes remain.
 
-You can also configure the Go program directly:
+For the native Windows gateway, start the development services with
+`start-redis.ps1` and optionally `start-usage.ps1`, then run `run.ps1`.
+The native gateway defaults to port 8080; its durable local outbox requires Linux.
+Go users can run `go run ./cmd/janus` with configuration exported as environment
+variables. See [container setup](docs/containers.md) and [startup troubleshooting](docs/startup.md).
 
-```powershell
-$env:OPENAI_API_KEY = 'your-provider-key'
-$env:JANUS_API_KEY = 'your-own-janus-client-key'
-go run .
+Request examples are in [examples](examples/). Keep credentials in ignored local
+configuration or environment variables. The gateway does not automatically load
+`.env`; the Windows launch script does.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Client --> Auth[Tenant authentication and concurrency admission]
+    Auth --> Quota[Redis RPM and estimated TPM reservation]
+    Quota --> Cache{Opt-in exact cache}
+    Cache -->|Hit| Client
+    Cache -->|Miss or bypass| Router[Provider circuit breakers and fallback]
+    Router --> Provider[OpenAI-compatible upstream]
+    Provider --> SSE[JSON response or flushed SSE stream]
+    SSE --> Client
+    SSE --> Complete[Reconcile reported token usage]
+    Complete --> Journal[Durable local completion journal on Linux]
+    Journal --> Queue[Separate persistent Redis usage Stream]
+    Queue --> Worker[Background worker: batches up to 64]
+    Worker --> DB[PostgreSQL transaction and request-ID deduplication]
+    DB --> Ack[Acknowledge and delete Redis entries after commit]
 ```
 
-If using the project-local Go toolchain instead:
+The quota/cache Redis and usage Redis are separate services with different
+persistence needs. Streaming responses are forwarded as received; RPM/TPM govern
+request admission, not response event speed. Usage persistence happens at handler
+completion. Read the [detailed lifecycle](docs/architecture.md).
 
-```powershell
-$env:GOCACHE = Join-Path (Get-Location) '.cache\go-build'
-.\.tools\go\bin\go.exe run .
-```
-
-The server listens on `127.0.0.1:8080`. Stop it with Ctrl+C.
-Environment variables must be set in the same terminal before starting the server.
-The Go program itself does not load `.env`; `run.ps1` handles that for local runs.
-
-`OPENAI_BASE_URL` defaults to `https://api.openai.com/v1`. You can set it to
-another trusted OpenAI-compatible provider's API base URL, including its version
-path. Janus appends `/chat/completions`. Remote endpoints require HTTPS;
-loopback HTTP endpoints are allowed for development.
-
-Without `JANUS_API_KEY`, startup fails so chat access cannot accidentally be public.
-Without a primary key, `/health` still works and chat can use a configured fallback;
-without either provider key, valid authenticated chat requests return 503.
-Keys belong in local environment variables, never in source or request JSON.
-
-## Client authentication
-
-Clients send `Authorization: Bearer <JANUS_API_KEY>` to Janus. The authentication
-middleware checks that key before decoding the chat body or calling a provider.
-Missing, malformed, duplicate, or incorrect credentials return a JSON 401 error
-with `WWW-Authenticate: Bearer`. `/health` stays public.
-
-The Janus client key and provider key are separate credentials. Janus constructs
-a new upstream request with `OPENAI_API_KEY`, rather than forwarding the client's
-Authorization header. Key comparison uses fixed-size SHA-256 hashes and a
-constant-time comparison. Keys are not logged.
-
-With no tenant configuration, this key identifies tenant `default`. Set
-`TENANTS_CONFIG` to a JSON file to configure individual client keys, independent
-RPM/TPM quotas, output limits and cache scopes. `JANUS_API_KEY` also protects
-administrative metrics; ordinary tenant keys grant chat access only.
-See [tenant configuration and rotation](docs/tenants.md).
-Authorization headers need HTTPS
-when exposing a gateway beyond local development; this server still binds only
-to loopback. Restart Janus after changing its configured key.
-
-## VS Code and a local Go toolchain
-
-If the Go extension cannot find `go`, set `go.alternateTools.go` in your local
-`.vscode/settings.json` to the absolute path of `.tools/go/bin/go.exe`.
-That settings file is ignored by Git because paths are machine-specific.
-Reload VS Code after changing the configuration. New integrated terminals can
-use `go` if `.tools/go/bin` is added to their PATH; existing terminals retain
-their previous environment.
-
-An unsaved editor tab can show an older version of a file changed on disk.
-Copy any notes or edits you want to keep, then use `File: Revert File` on that
-tab to load the saved version. Saving the stale tab instead would overwrite
-the newer file on disk.
-
-## Redis request rate limiting
-
-`REDIS_URL` selects Redis (default `redis://127.0.0.1:6379/0`; our local `.env`
-uses port 6380). `RPM_LIMIT` defaults to 60 and must be a positive integer up to
-1000000. Janus checks Redis at startup and refuses to start if it cannot connect.
-
-After authentication and body validation, a token bucket controls RPM admission. The bucket
-holds up to `RPM_LIMIT` request slots and refills that many per minute. At 60 RPM,
-an idle bucket permits a burst of 60 calls and then replenishes one slot per
-second. This is an average refill rate plus burst capacity, not a strict cap in
-every rolling 60-second interval. These slots are request permits, not LLM tokens.
-
-A Lua script uses Redis's clock and atomically reads, refills, checks, and updates
-the bucket. All gateway instances using the same Redis database and configured
-tenant ID share the same bucket. The Redis key contains a SHA-256 fingerprint
-of the stable tenant identity, not its client credential. Idle buckets expire
-after two minutes. Rotating credentials preserves the tenant's quota.
-
-Exhausted quota returns JSON 429 with `Retry-After` in whole seconds. Successful
-checks include `X-RateLimit-Limit` and `X-RateLimit-Remaining`. Redis failures
-return 503 before calling the provider. Admission checks have a 750 ms budget;
-mutating commands are not automatically retried because they might have executed.
-
-Unauthenticated requests, invalid bodies, and `/health` do not consume quota.
-Valid admitted chat attempts consume one RPM slot, including upstream failures.
-Streaming consumes one request slot at admission, not one per event. A single
-Lua script admits both RPM and TPM together; rejection consumes neither.
-
-Redis provides shared state across Janus restarts. Restarting this ephemeral
-development Redis resets that state. Production persistence, replication, and
-outage policies need further work. Redis limiter reference:
-[Redis rate limiter documentation](https://redis.io/docs/latest/develop/use-cases/rate-limiter/).
-
-## Token quota and reconciliation
-
-`TPM_LIMIT` defaults to 60000 tokens in a rolling 60-second admission window.
-`MAX_OUTPUT_TOKENS` defaults to 1024 and must be smaller than `TPM_LIMIT`.
-Both settings accept positive integers up to 100000000. Clients can request
-`max_completion_tokens` between 1 and `MAX_OUTPUT_TOKENS`; omission uses that
-configured maximum. Janus sends the allowance to the provider, which can end
-generation at that cap. Quota reconciliation does not cut streams.
-
-Before calling the provider, Janus reserves estimated input plus the output
-allowance. The first estimator uses UTF-8 byte lengths and message overhead.
-It is a heuristic, not a model tokenizer: it often overestimates text and can
-underestimate provider framing. Accurate tokenizers remain future work.
-
-Redis tracks reservations by request ID and admission time. After successful
-responses with valid prompt/completion/total usage, Janus replaces the reserved
-charge with actual usage. Smaller usage releases capacity; larger usage adds
-debt that can block future admissions. Settlement is idempotent. Charges age
-out 60 seconds after admission; late settlement never credits a newer window.
-
-Streams request `stream_options.include_usage`. A bounded SSE observer recognizes
-top-level `usage` and Groq's `x_groq.usage` without changing forwarded bytes.
-Settlement requires clean EOF, `[DONE]`, and valid usage. Missing usage or an
-uncertain upstream failure retains the reservation until it ages out. No
-upstream attempt releases TPM to zero, but the RPM permit remains spent.
-
-Settlement runs at handler completion with a bounded Redis call, including
-after client cancellation. It is not a durable worker pipeline. A crash or
-failed settlement leaves the conservative reservation.
-
-`X-TokenLimit-Limit`, `X-TokenLimit-Remaining`, and `X-TokenLimit-Reserved`
-show admission values before refunds. On rejection, Reserved is the requested
-allowance, not an accepted charge. Exhausted TPM returns 429 with `Retry-After`;
-a single request exceeding total capacity returns 400 so it can be reduced.
-
-See [token accounting maths](docs/token-accounting.md) and the
-[Groq API reference](https://console.groq.com/docs/api-reference).
-
-## Send a request
-
-`request.json` contains a small Groq chat request. When changing providers, set
-its `model` to a model ID available to your account.
-In a second PowerShell terminal:
-
-```powershell
-Invoke-RestMethod -Uri http://localhost:8080/health
-
-# Load only the Janus client key in this terminal, without displaying it.
-$janusKey = (Get-Content .env | Where-Object { $_ -like 'JANUS_API_KEY=*' }).Split('=', 2)[1]
-
-$response = Invoke-RestMethod `
-  -Uri http://localhost:8080/v1/chat/completions `
-  -Method Post `
-  -Headers @{ Authorization = "Bearer $janusKey" } `
-  -ContentType 'application/json' `
-  -InFile request.json
-
-$response.choices[0].message.content
-```
-
-PowerShell summarizes nested objects. To print the answer, store the result in
-`$response` and read `$response.choices[0].message.content`. To inspect all fields,
-use `$response | ConvertTo-Json -Depth 20`.
-
-## Streaming
-
-Start Janus with `.\run.ps1`. In a second terminal, use the native curl executable:
-
-```powershell
-$janusKey = (Get-Content .env | Where-Object { $_ -like 'JANUS_API_KEY=*' }).Split('=', 2)[1]
-
-curl.exe --no-buffer --silent --show-error `
-  http://localhost:8080/v1/chat/completions `
-  -H "Authorization: Bearer $janusKey" `
-  -H "Content-Type: application/json" `
-  --data-binary "@request-stream.json"
-```
-
-`request-stream.json` sets `stream: true`. A normal request returns one complete
-JSON answer. A streaming request returns Server-Sent Events (SSE) over the same
-HTTP response as the provider generates them. Each event is separated by a blank
-line, typically with `data: {...}` containing JSON. Text fragments appear under
-`choices[0].delta.content`; some events contain roles, reasoning, finish reasons,
-or usage instead. `data: [DONE]` is the provider's completion marker.
-
-Janus checks for a successful `text/event-stream` response, then reads into a
-32 KiB buffer, writes the available bytes, and flushes. Flushing sends buffered
-bytes toward the client immediately. A network read is not necessarily one
-token or one event: events and UTF-8 characters can span reads. Janus preserves
-all bytes and framing; clients assemble and parse the events. `--no-buffer`
-also tells curl to display incoming data without waiting for its output buffer.
-
-Streaming reduces the wait for the first visible text, not necessarily the time
-to generate the entire answer. It uses bounded memory instead of collecting the
-whole response. Slow client writes naturally pause upstream reads (backpressure).
-
-Provider JSON errors before streaming begins retain their status and body.
-After SSE headers have been sent, Janus cannot replace the HTTP status or switch
-to a JSON error. A read/write failure aborts the response without appending a
-fake completion marker. Clients must treat a stream without `[DONE]` as
-incomplete. Client disconnection cancels the upstream request. The current
-60-second timeout applies to the whole provider call, including streaming;
-separate idle and total deadlines are a future refinement. Janus observes usage
-and completion markers alongside forwarding to settle token reservations.
-
-Tests use a gated fake provider to prove bytes arrive before generation finishes,
-preserve a split UTF-8 character and SSE framing, check cancellation, and check
-interrupted streams and errors. Provider protocol:
-[Groq streaming documentation](https://console.groq.com/docs/text-chat).
-
-## Current request flow
+## Repository layout
 
 ```text
-Client -> router -> authentication -> JSON decoding and validation
-       -> Redis atomic RPM check + TPM reservation -> primary circuit breaker
-       -> primary provider call -> qualifying failure before streaming?
-      -> optional fallback TPM allocation + breaker + provider call
-       <- provider's JSON response and HTTP status <-
-       -> reconcile TPM from actual provider usage in Redis
-
-Opted-in non-streaming: authenticate -> validate -> RPM -> Redis cache
-                       -> HIT: stored JSON, no TPM or provider
-                       -> MISS/error: TPM -> normal provider routing
-                       -> eligible primary response: store with TTL
+cmd/janus/              executable entrypoint
+cmd/loadtest/           fake providers and load-test client
+internal/gateway/       gateway implementation and colocated tests
+  migrations/          embedded initial usage schema
+examples/               request payloads and tenant configuration template
+queries/                usage reporting SQL
+scripts/                portable demo and load-test helpers
+docs/                   architecture, operations, demo, and design notes
+.github/workflows/      automated verification
+compose*.yaml           normal, disposable demo, and isolated load fixtures
+*.ps1                   Windows launch, demo, reporting, and benchmark commands
 ```
 
-Supported input fields: `model`, `messages`, `stream` (defaults to false),
-`max_completion_tokens`, and `stream_options` with `include_usage`.
-Messages support `system`, `user`, and `assistant` roles with non-empty string
-content. Other fields, tool calls, and multimodal content are not
-implemented yet. Provider response bodies are forwarded without changing their
-JSON, so completion data and usage are preserved.
+## Verification
 
-Request bodies are limited to 1 MiB; buffered JSON provider responses to 4 MiB.
-SSE responses use a fixed-size buffer without the 4 MiB total-body limit.
-Provider calls have a 60-second timeout and use the incoming request's context
-for cancellation. JSON provider errors keep their status (including 429) and
-`Retry-After`; network failures return 502 and timeouts return 504. Redirects
-are rejected. Non-streaming responses are buffered before sending to the client.
-
-## Provider circuit breaker
-
-Each configured Provider owns a breaker scoped to its endpoint and credential.
-Five consecutive qualifying failures open it for 30 seconds. An open circuit
-returns a Janus JSON 503 with `Retry-After`, without calling the provider.
-When cooldown expires, the next incoming request becomes the single half-open
-probe; other calls receive 503 with `Retry-After: 1` while it is running. No
-background health request is generated. Recovery is not guaranteed by that
-retry hint.
-
-Network errors, upstream timeouts, HTTP 429/5xx, invalid or oversized JSON,
-unexpected redirects, and invalid or incomplete SSE count as failures. Valid
-non-429 4xx responses demonstrate reachability and reset the failure streak;
-their original status/body are preserved. Client cancellations and stream writes
-that fail toward the client do not count as provider outages. Concurrent results
-count in completion order within the current breaker generation.
-
-A streaming probe stays in flight until the stream ends. Clean EOF with a
-recognized `[DONE]` means breaker success even if token usage is missing;
-TPM settlement separately requires valid usage. Upstream read errors still
-abort an active stream; the breaker only affects future requests. A canceled
-probe returns to open for another cooldown so the trial slot cannot get stuck.
-Results from calls admitted before a state transition cannot alter the new state.
-
-The breaker is guarded by a Go mutex and lives in each Janus process, not Redis.
-Restarting Janus resets it; separate instances have separate breakers. The mutex
-is held only for short state changes, never while waiting on HTTP. Calls already
-in flight can continue after the circuit opens. The router can select the optional
-fallback while a primary circuit is open; it does not retry the same provider.
-
-Quota admission runs first. With no fallback, a breaker-blocked call releases
-TPM because no upstream attempt happened; RPM remains spent. With fallback,
-the unused original TPM allocation is reused for that provider attempt.
-See [breaker examples and design](docs/circuit-breaker.md).
-
-## Optional provider fallback
-
-The primary settings remain `OPENAI_BASE_URL` and `OPENAI_API_KEY`; in our local
-setup these point to Groq. A non-empty `FALLBACK_API_KEY` enables one secondary
-OpenAI-compatible endpoint. `FALLBACK_BASE_URL` defaults to
-`https://api.openai.com/v1`; `FALLBACK_MODEL` defaults to `gpt-4o-mini`.
-Leave the fallback key empty to disable it. `run.ps1` loads all three settings.
-
-Our current local fallback uses a second Groq key with
-`FALLBACK_BASE_URL=https://api.groq.com/openai/v1` and
-`FALLBACK_MODEL=openai/gpt-oss-20b`. JSON and SSE fallback were live-verified.
-This can help with credential-specific failures, but both routes depend on
-Groq availability. Keys in the same Groq account may share provider quotas.
-The OpenAI settings remain available as an alternative; its earlier key was
-rejected with HTTP 401.
-
-The primary receives the client's model unchanged. The fallback receives the
-same messages, stream settings, and output allowance with its configured model
-substituted. Responses retain the selected provider's actual model and JSON/SSE
-bytes. `X-Janus-Route: primary` or `fallback` identifies the selected route.
-This intentionally allows a different model to answer; quality can differ.
-
-Fallback can follow an open circuit, missing primary key, network failure,
-upstream timeout, 429/5xx, invalid buffered response, redirect, or invalid SSE
-content type before streaming begins. Other provider 4xx errors are returned
-unchanged. Client cancellation stops routing. There are at most two attempts,
-one per provider, with separate breakers and credentials. No provider error is
-sent to the client before deciding whether to fall back. Once primary SSE
-headers have been sent, an interrupted stream is aborted with no provider switch.
-If both providers fail, return the fallback's error/status and Retry-After.
-
-One client request spends one RPM permit. If primary was attempted, reconcile
-its usage separately, retaining its full reservation when usage is unknown.
-Then reserve another TPM allocation before calling fallback, without charging
-RPM again. Insufficient TPM returns a Janus 429; Redis failure returns 503.
-If primary was skipped, reuse the unspent original allocation. The original
-X-TokenLimit headers describe initial admission, not total fallback spend.
-
-Each provider attempt has its own 60-second timeout, so two slow attempts can
-take roughly 120 seconds. A shorter end-to-end routing deadline, capability
-mapping, load balancing, and durable cost accounting remain future work.
-
-For budget-conscious learning, the selected `gpt-4o-mini` model lists $0.15 per
-million input tokens and $0.60 per million output tokens. A 1000-input,
-500-output call is approximately $0.00045 at those uncached standard rates.
-Verify current prices in the
-[official model documentation](https://developers.openai.com/api/docs/models/gpt-4o-mini).
-Janus does not enforce dollar budgets; TPM is a token allocation limit.
-
-The ordinary test suite uses fake providers. `TestLiveConfiguredFallback` requires
-explicit `JANUS_LIVE_FALLBACK=1`, `FALLBACK_API_KEY`, and `REDIS_TEST_URL`.
-It uses the configured fallback URL/model, simulates a primary failure, and
-sends up to two potentially billed calls, each with a 256-token output cap.
-It never loads `.env` itself or prints credentials.
-See [fallback design and accounting examples](docs/fallback-routing.md).
-
-This is a local development gateway. Accurate tokenization,
-wider provider routing, richer analytics, and lossless billing are future steps.
-
-## Exact response caching
-
-Opt in with `X-Janus-Cache: true` on non-streaming requests. Janus stores complete
-successful primary text answers in the same Redis used for quotas, under separate
-SHA-256 keys. `CACHE_TTL_SECONDS` defaults to 300; zero disables caching.
-Streaming and fallback answers bypass storage. Cache hits spend one RPM permit,
-reserve zero TPM, and do not call the provider. Opted-in misses spend RPM before
-checking TPM; ordinary requests retain combined quota admission.
-
-Response headers show `X-Janus-Cache: HIT`, `MISS`, `BYPASS`, or `ERROR`.
-Hits use `X-Janus-Route: cache`. Original response usage is preserved but does not
-increase fresh provider usage metrics. Cache errors continue normal generation
-when quotas are available. See [cache design and PowerShell examples](docs/caching.md).
-
-## Request logs and metrics
-
-Janus emits one JSON console event per completed chat, with a server-generated
-`X-Request-ID`, selected route, HTTP status, outcome, duration, streaming TTFT,
-and per-attempt token usage. Prompts, answers, credentials, and model strings
-are excluded. Startup and diagnostic messages remain plain text.
-
-Fetch metrics using the Janus key:
-
-```powershell
-$janusKey = (Get-Content .env | Where-Object { $_ -like 'JANUS_API_KEY=*' }).Split('=', 2)[1]
-(Invoke-WebRequest -Uri http://localhost:8080/metrics `
-  -Headers @{ Authorization = "Bearer $janusKey" }).Content
-```
-
-`/metrics` is authenticated and bypasses chat quotas. It exposes request and
-attempt counters, known/unknown token usage, fallback selections, in-flight
-requests, latency histograms, logging loss, and circuit state. Metrics live in
-memory and reset on restart. No Prometheus server or Grafana dashboard is installed.
-
-Streaming TTFT measures the first flushed text delta, not header arrival. A 200
-stream without completion is recorded as interrupted. Logs go through a bounded
-256-event background queue; a full queue drops logs and increments a counter
-instead of delaying chat. This is not durable billing. Total latency includes
-provider generation and quota settlement, rather than isolated proxy overhead.
-See [observability notes and examples](docs/observability.md).
-
-## Durable usage storage
-
-The Linux Compose stack also enables a persistent local completion outbox with
-[batched journal writes](docs/group-commit.md).
-Completed events are flushed locally before Redis delivery, and unfinished
-handoffs replay on restart. See [outbox design and recovery boundaries](docs/durable-outbox.md).
-
-Set both `DATABASE_URL` and `USAGE_REDIS_URL` to enable storage, or leave both
-empty to disable it. Our local setup uses PostgreSQL in WSL on 5432 and a separate
-persistent Redis on 6381. Start `.\start-usage.ps1` in another terminal before
-Janus; keep the existing quota/cache Redis on 6380 running too.
-
-Completed authenticated requests enqueue a bounded usage event. A background
-Go worker saves the request and provider attempts transactionally, deduplicates
-replayed request IDs, then acknowledges the queue entry. Database outages retain
-queued events for retry. Cache hits create zero new provider token usage;
-unknown usage stays NULL. `.\usage-report.ps1` shows daily totals per tenant.
-
-Enqueue failures are visible in logs/metrics and can leave accounting gaps;
-crashes before enqueue are not covered. See [worker design, setup and limitations](docs/usage-storage.md).
-
-## Local performance benchmark
-
-This same-process harness leaves the local outbox disabled. Use `loadtest.ps1`
-to measure the Linux gateway with outbox durability enabled.
-
-`.\benchmark.ps1 -Mode full -Requests 500 -Concurrency 1,16` compares a local fake
-provider with Janus, measuring JSON latency, streaming first-text latency,
-p50/p99, throughput, failures and usage backlog. It uses real Redis/PostgreSQL
-with isolated benchmark state and makes no billed provider calls.
-Use `-Mode core` to measure HTTP/auth/routing/SSE without those services;
-core results do not validate full gateway overhead. Reports are in `.cache/perf`.
-The benchmark defaults to two Go CPUs; use `-GoCPUs 1`, `2`, or `4` to compare
-runtime configurations. Reports also include means for quota admission,
-settlement and durable enqueue. The worker now commits available events in
-batches of up to 64 before acknowledging them, and upstream HTTP clients retain
-idle connections after concurrent bursts.
-See [usage worker tuning](docs/usage-worker-tuning.md) for stage measurements,
-recovery scans and the longer load-test comparison.
-See [percentiles, benchmark scenarios and interpretation](docs/performance.md).
-
-## Check
-
-```powershell
+```sh
 go test ./...
 go vet ./...
+go build ./cmd/...
 ```
 
-To also exercise the real Redis script and concurrent admission across two
-gateway clients, start Redis, then run:
+Redis/PostgreSQL integration tests require `REDIS_TEST_URL` and
+`POSTGRES_TEST_URL`; otherwise they skip. On Windows, `containers.ps1 -Action test`
+runs the complete Linux suite with those services. GitHub CI runs race-enabled
+integration tests, the demo, Linux/Windows compilation, and a runtime image build.
+Live-provider tests are opt-in and remain disabled in CI.
 
-```powershell
-$env:REDIS_TEST_URL = 'redis://127.0.0.1:6380/0'
-go test -timeout 30s ./...
-```
+Use `loadtest.ps1` for isolated fake-provider load tests; no paid APIs are used.
+Existing measured results are summarized in [worker tuning](docs/usage-worker-tuning.md)
+and [journal batching](docs/group-commit.md). Results are local observations,
+not a production capacity guarantee; JSON latency results were mixed.
 
-Replace `go` with `.\.tools\go\bin\go.exe` if using the local toolchain.
-Tests use local fake providers and make no paid API calls.
+## Release boundaries
+
+- Text messages only; no tool calling, multimodal inputs, or native Anthropic/Gemini adapters.
+- One primary and one fallback; no weighted routing or semantic cache.
+- Input tokens use a byte heuristic. Reported provider usage reconciles reservations;
+  accurate model tokenizers remain future work.
+- Exact caching is opt-in and limited to eligible non-streaming primary responses.
+- A crash during generation or before journal confirmation can leave missing usage.
+  Disk loss, replication, and invoice reconciliation are outside this guarantee.
+- Startup tenant configuration supports isolation/rotation; live administration and
+  dollar budgets remain future work. Stored token history is not an invoice ledger.
+- TLS termination, managed secrets, backups, production soak tests, and stable latency
+  verification are deployment work, not completed by this MVP.
+
+See [release checklist and limitations](docs/release.md), [contributing](CONTRIBUTING.md),
+and the [documentation index](docs/README.md).

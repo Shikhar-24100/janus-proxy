@@ -66,8 +66,8 @@ Keep Redis and Janus running. In another PowerShell terminal:
 ```powershell
 $janusKey = (Get-Content .env | Where-Object { $_ -like 'JANUS_API_KEY=*' }).Split('=', 2)[1]
 $headers = @{ Authorization = "Bearer $janusKey"; 'X-Janus-Cache' = 'true' }
-$first = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:8080/v1/chat/completions -Method Post -Headers $headers -ContentType 'application/json' -InFile request.json
-$second = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:8080/v1/chat/completions -Method Post -Headers $headers -ContentType 'application/json' -InFile request.json
+$first = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:8080/v1/chat/completions -Method Post -Headers $headers -ContentType 'application/json' -InFile examples/request.json
+$second = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:8080/v1/chat/completions -Method Post -Headers $headers -ContentType 'application/json' -InFile examples/request.json
 $first.Headers['X-Janus-Cache']
 $second.Headers['X-Janus-Cache']
 $second.Headers['X-TokenLimit-Reserved']

@@ -29,7 +29,7 @@ continue granting chat access. Otherwise it grants only administrative metrics
 access. `JANUS_API_KEY` remains required for `GET /metrics`; other tenant keys
 cannot read the gateway's aggregate metrics.
 
-Copy `tenants.example.json` and set each tenant's environment variable in `.env`.
+Copy `examples/tenants.example.json` and set each tenant's environment variable in `.env`.
 Our `run.ps1` accepts tenant credential names ending in `_JANUS_API_KEY`, such as
 `ALICE_JANUS_API_KEY`. The Go application can read other uppercase variable names
 when you set them directly in its environment. The JSON stores variable names,
@@ -97,7 +97,7 @@ The local setup includes default, Alice and Bob, with credentials in your ignore
 
 ```powershell
 $aliceKey = (Get-Content .env | Where-Object { $_ -like 'ALICE_JANUS_API_KEY=*' }).Split('=', 2)[1]
-$response = Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post -Headers @{ Authorization = "Bearer $aliceKey"; 'X-Janus-Cache' = 'true' } -ContentType 'application/json' -InFile request.json
+$response = Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post -Headers @{ Authorization = "Bearer $aliceKey"; 'X-Janus-Cache' = 'true' } -ContentType 'application/json' -InFile examples/request.json
 $response.Headers['X-RateLimit-Limit']
 $response.Headers['X-TokenLimit-Limit']
 ($response.Content | ConvertFrom-Json).choices[0].message.content

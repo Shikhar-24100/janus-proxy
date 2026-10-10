@@ -52,7 +52,7 @@ try {
         $arguments += @('-cpuprofile', ".cache/perf/$Mode-cpu.pprof", '-memprofile', ".cache/perf/$Mode-heap.pprof", '-o', ".cache/perf/$Mode.test.exe")
     }
     Write-Host "Local fake provider benchmark: $Mode mode, $Requests requests per scenario, concurrency $($Concurrency -join ','), Go CPUs $GoCPUs."
-    & $goPath @arguments .
+    & $goPath @arguments ./internal/gateway
     if ($LASTEXITCODE -ne 0) { throw 'Benchmark failed; inspect its errors above.' }
     $reportName = "latest-$Mode"
     if ($Profile) { $reportName += '-profiled' }

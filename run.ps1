@@ -27,7 +27,7 @@ $env:GOMODCACHE = Join-Path $PSScriptRoot '.cache\go-mod'
 Push-Location $PSScriptRoot
 try {
     Write-Host 'Building and starting Janus. The first Go build can take a while; startup diagnostics follow below.'
-    & $goPath run -p 1 .
+    & $goPath run -p 1 ./cmd/janus
     if ($LASTEXITCODE -ne 0) { throw 'Janus exited with an error. Check the server output above.' }
 } finally {
     Pop-Location

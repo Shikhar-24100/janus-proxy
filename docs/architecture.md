@@ -1,7 +1,11 @@
 # Janus architecture and progress
 
-Janus runs on Windows. Redis is a separate server in Ubuntu WSL on port 6380;
-it is not embedded inside Go. Groq is the remote LLM provider.
+Janus runs natively on Windows or in Linux containers. Redis and PostgreSQL
+are separate servers, not embedded inside Go. The native development quota Redis
+uses port 6380 in Ubuntu WSL; Compose uses private service addresses. Upstreams
+speak the OpenAI-compatible API, with Groq used in the original live examples.
+The executable lives in `cmd/janus`; implementation and tests are in
+`internal/gateway`. See [release scope](release.md) for the frozen MVP boundaries.
 
 ```text
 Client (PowerShell, curl, browser app)

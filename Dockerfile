@@ -3,17 +3,18 @@ FROM golang:1.27.1-alpine3.24 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY *.go ./
-COPY migrations/ ./migrations/
+COPY internal/gateway/ ./internal/gateway/
 COPY queries/ ./queries/
+COPY cmd/janus/ ./cmd/janus/
 COPY cmd/loadtest/ ./cmd/loadtest/
+COPY scripts/demo.sh ./scripts/demo.sh
 
 FROM build AS test
 RUN go test -p 1 ./...
 
 FROM build AS binary
 # Keep compiler caches out of image layers; these temporary mounts use build-time RAM.
-RUN --mount=type=tmpfs,target=/root/.cache/go-build,size=1073741824 --mount=type=tmpfs,target=/tmp,size=536870912 CGO_ENABLED=0 go build -p 1 -trimpath -ldflags="-s -w" -o /out/janus .
+RUN --mount=type=tmpfs,target=/root/.cache/go-build,size=1073741824 --mount=type=tmpfs,target=/tmp,size=536870912 CGO_ENABLED=0 go build -p 1 -trimpath -ldflags="-s -w" -o /out/janus ./cmd/janus
 
 FROM build AS load-binary
 RUN --mount=type=tmpfs,target=/root/.cache/go-build,size=1073741824 --mount=type=tmpfs,target=/tmp,size=536870912 CGO_ENABLED=0 go build -p 1 -trimpath -o /out/loadtest ./cmd/loadtest

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7.4.11-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      postgres:
+        image: postgres:16.15-alpine
+        env:
+          POSTGRES_USER: janus
+          POSTGRES_PASSWORD: fixture-password
+          POSTGRES_DB: janus
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U janus -d janus"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      REDIS_TEST_URL: redis://127.0.0.1:6379/0
+      POSTGRES_TEST_URL: postgres://janus:fixture-password@127.0.0.1:5432/janus?sslmode=disable
+      JANUS_LIVE_FALLBACK: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: go.sum
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Static checks
+        run: go vet ./...
+      - name: Integration and race tests
+        run: go test -race -count=1 -timeout 3m ./...
+      - name: Reproducible demo
+        run: sh scripts/demo.sh
+      - name: Build executables
+        run: go build ./cmd/...
+      - name: Check Windows compilation
+        env:
+          GOOS: windows
+          CGO_ENABLED: "0"
+        run: go build ./cmd/...
+      - name: Validate container fixtures
+        run: |
+          docker compose -f compose.loadtest.yaml config --quiet
+          docker compose -f compose.demo.yaml config --quiet
+      - name: Build runtime image
+        run: docker build --target runtime -t janus:ci .

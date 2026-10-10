@@ -1,0 +1,34 @@
+# Disposable services; no local env files, provider keys, or published ports.
+name: janus-demo
+services:
+  redis:
+    image: redis:7.4.11-alpine
+    command: [redis-server, --save, "", --appendonly, "no", --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  postgres:
+    image: postgres:16.15-alpine
+    environment:
+      POSTGRES_USER: janus
+      POSTGRES_PASSWORD: fixture-password
+      POSTGRES_DB: janus
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U janus -d janus"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  demo:
+    build: {context: ., target: build}
+    environment:
+      REDIS_TEST_URL: redis://redis:6379/0
+      POSTGRES_TEST_URL: postgres://janus:fixture-password@postgres:5432/janus?sslmode=disable
+      JANUS_LIVE_FALLBACK: "0"
+    command: [sh, scripts/demo.sh]
+    depends_on:
+      redis: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+networks:
+  default: {internal: true}

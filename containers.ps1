@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('init', 'up', 'down', 'ps', 'logs', 'report', 'test', 'benchmark')][string]$Action = 'up',
+    [ValidateSet('init', 'up', 'down', 'ps', 'logs', 'report', 'test', 'demo', 'benchmark')][string]$Action = 'up',
     [ValidateRange(100, 5000)][int]$Requests = 500,
     [ValidateRange(1, 128)][int]$GoCPUs = 2,
     [int[]]$Concurrency = @(1, 16)
@@ -9,6 +9,10 @@ foreach ($level in $Concurrency) {
     if ($level -lt 1 -or $level -gt 128) { throw 'Concurrency must be between 1 and 128.' }
 }
 if ($Concurrency.Count -eq 0) { throw 'Specify at least one concurrency level.' }
+if ($Action -eq 'demo') {
+    & (Join-Path $PSScriptRoot 'demo.ps1')
+    return
+}
 
 if ($Action -eq 'init') {
     # Never overwrite rotated credentials or a password belonging to an existing DB.
@@ -56,11 +60,11 @@ if ($Action -eq 'init') {
 foreach ($name in @('.env.compose', '.env.container', '.container/tenants.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $name))) { throw 'Run .\containers.ps1 -Action init first.' }
 }
-if ($Action -in @('up', 'test', 'benchmark')) {
+if ($Action -in @('up', 'test', 'demo', 'benchmark')) {
     $allowlist = Get-Content -LiteralPath (Join-Path $PSScriptRoot '.dockerignore')
-    foreach ($sourceFile in Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.go' -File) {
-        if ("!$($sourceFile.Name)" -cnotin $allowlist) {
-            throw "Add !$($sourceFile.Name) to .dockerignore's source allowlist before building."
+    foreach ($sourceDirectory in @('internal/gateway','cmd/janus','cmd/loadtest')) {
+        if ("!$sourceDirectory/*.go" -cnotin $allowlist) {
+            throw "Add !$sourceDirectory/*.go to .dockerignore's source allowlist before building."
         }
     }
 }
@@ -94,6 +98,7 @@ switch ($Action) {
     'ps' { $arguments = @('ps') }
     'logs' { $arguments = @('logs', '--tail', '100', 'janus') }
     'test' { $arguments = @('run', '--rm', '--build', 'tools', 'go', 'test', '-p', '1', '-count=1', '-timeout', '2m', './...') }
+    'demo' { $arguments = @('run', '--rm', '--build', 'tools', 'sh', 'scripts/demo.sh') }
     'benchmark' {
         $null = New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot '.cache/perf-linux')
         $arguments = @('run', '--rm', '--build', '-e', 'JANUS_PERF=1', '-e', 'JANUS_PERF_MODE=full', '-e', "JANUS_PERF_REQUESTS=$Requests", '-e', "JANUS_PERF_CONCURRENCY=$($Concurrency -join ',')", '-e', "GOMAXPROCS=$GoCPUs", 'tools', 'go', 'test', '-p', '1', '-count=1', '-run', '^TestGatewayPerformance$', '-timeout', '20m', '-v', './...')
